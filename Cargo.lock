@@ -641,6 +641,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "color-backtrace"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "150fd80a270c0671379f388c8204deb6a746bb4eac8a6c03fe2460b2c0127ea0"
+dependencies = [
+ "backtrace",
+ "termcolor",
+]
+
+[[package]]
 name = "color-eyre"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4460,7 +4470,9 @@ dependencies = [
 name = "rustc_resolve"
 version = "0.0.0"
 dependencies = [
+ "backtrace",
  "bitflags 2.4.2",
+ "color-backtrace",
  "pulldown-cmark 0.9.6",
  "rustc_arena",
  "rustc_ast",
