@@ -3795,6 +3795,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         );
     }
 
+    // shank: (#useful) "smart" resolution of path fragment seems useful...
     #[instrument(level = "debug", skip(self))]
     fn smart_resolve_path_fragment(
         &mut self,

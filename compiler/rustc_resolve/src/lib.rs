@@ -746,6 +746,8 @@ struct PrivacyError<'a> {
 #[derive(Debug)]
 struct UseError<'a> {
     err: Diag<'a>,
+    // shank: (#useful) this is what I am looking for. But how are these constructed in the first
+    // place?
     /// Candidates which user could `use` to access the missing type.
     candidates: Vec<ImportSuggestion>,
     /// The `DefId` of the module to place the use-statements in.
@@ -1669,19 +1671,27 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
     pub fn resolve_crate(&mut self, krate: &Crate) {
         self.tcx.sess.time("resolve_crate", || {
             self.tcx.sess.time("finalize_imports", || self.finalize_imports());
+            tracing::debug!(">> finalize_imports done..");
             let exported_ambiguities = self.tcx.sess.time("compute_effective_visibilities", || {
                 EffectiveVisibilitiesVisitor::compute_effective_visibilities(self, krate)
             });
+            tracing::debug!(">> exported_ambiguities computed..");
             self.tcx.sess.time("check_hidden_glob_reexports", || {
                 self.check_hidden_glob_reexports(exported_ambiguities)
             });
+            tracing::debug!(">> hidden glob reexports checked..");
             self.tcx
                 .sess
                 .time("finalize_macro_resolutions", || self.finalize_macro_resolutions(krate));
+            tracing::debug!(">> macro resolutions finalized..");
             self.tcx.sess.time("late_resolve_crate", || self.late_resolve_crate(krate));
+            tracing::debug!(">> late_resolve_crate() done..");
             self.tcx.sess.time("resolve_main", || self.resolve_main());
-            self.tcx.sess.time("resolve_check_unused", || self.check_unused(krate));
+            tracing::debug!(">> resolve_main() done..");
+            self.tcx.sess.time("resolve_main()", || self.check_unused(krate));
+            tracing::debug!(">> check_unused() done..");
             self.tcx.sess.time("resolve_report_errors", || self.report_errors(krate));
+            tracing::debug!(">> report_errors() done..");
             self.tcx
                 .sess
                 .time("resolve_postprocess", || self.crate_loader(|c| c.postprocess(krate)));
@@ -1986,6 +1996,8 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         module
     }
 
+    // shank: (#useful) before this, the `FromStr` has already been resolved to
+    // `core::str::traits::FromStr`
     fn record_partial_res(&mut self, node_id: NodeId, resolution: PartialRes) {
         debug!("(recording res) recording {:?} for {}", resolution, node_id);
         if let Some(prev_res) = self.partial_res_map.insert(node_id, resolution) {

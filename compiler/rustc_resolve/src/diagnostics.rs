@@ -31,9 +31,13 @@ use thin_vec::{thin_vec, ThinVec};
 use tracing::debug;
 
 use crate::errors::{
-    self, AddedMacroUse, ChangeImportBinding, ChangeImportBindingSuggestion, ConsiderAddingADerive,
+    AddedMacroUse, ChangeImportBinding, ChangeImportBindingSuggestion, ConsiderAddingADerive,
     ExplicitUnsafeTraits, MacroDefinedLater, MacroSuggMovePosition, MaybeMissingMacroRulesName,
 };
+
+// shank:
+use tracing::instrument;
+
 use crate::imports::{Import, ImportKind};
 use crate::late::{PatternSource, Rib};
 use crate::{errors as errs, BindingKey};
@@ -1145,6 +1149,8 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         }
     }
 
+    // shank:
+    #[instrument(skip(self,namespace,parent_scope,start_module,crate_path,filter_fn))]
     fn lookup_import_candidates_from_module<FilterFn>(
         &mut self,
         lookup_ident: Ident,
@@ -1274,6 +1280,17 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                                 None
                             };
 
+                            // shank: this is the only place where an `ImportSuggestion` is being
+                            // created
+                            tracing::debug!(">> adding candidate:\n{:#?}", ImportSuggestion {
+                                did,
+                                descr: res.descr(),
+                                path: path.clone(),
+                                accessible: child_accessible,
+                                doc_visible: child_doc_visible,
+                                note: note.clone(),
+                                via_import,
+                            });
                             candidates.push(ImportSuggestion {
                                 did,
                                 descr: res.descr(),
@@ -1332,6 +1349,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
     ///
     /// N.B., the method does not look into imports, but this is not a problem,
     /// since we report the definitions (thus, the de-aliased imports).
+    //
+    // shank: ah this is the method that finds possible alterative candidates!
+    #[instrument(level = "debug", skip_all)]
     pub(crate) fn lookup_import_candidates<FilterFn>(
         &mut self,
         lookup_ident: Ident,
@@ -1745,11 +1765,17 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         None
     }
 
+    // shank: interesting
     fn report_privacy_error(&mut self, privacy_error: &PrivacyError<'a>) {
         let PrivacyError { ident, binding, outermost_res, parent_scope, single_nested, dedup_span } =
             *privacy_error;
 
+        // shank:
+        tracing::debug!(">> binding:\n{binding:#?}");
+
         let res = binding.res();
+        // shank:
+        tracing::debug!(">> res: {res:#?}");
         let ctor_fields_span = self.ctor_fields_span(binding);
         let plain_descr = res.descr().to_string();
         let nonimport_descr =
@@ -1764,6 +1790,8 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             self.dcx().create_err(errors::IsPrivate { span: ident.span, ident_descr, ident });
 
         let mut not_publicly_reexported = false;
+        // shank:
+        tracing::debug!(">> outermost_res:\n{outermost_res:#?}");
         if let Some((this_res, outer_ident)) = outermost_res {
             let import_suggestions = self.lookup_import_candidates(
                 outer_ident,
@@ -2809,6 +2837,7 @@ fn show_candidates(
                 "if you meant to match on {kind}{instead}{name}, use the full path in the pattern",
             )
         } else {
+            // shank: (#useful) this must be the line that prints the suggestion.
             format!("consider importing {determiner} {kind}{through}{instead}")
         };
 
