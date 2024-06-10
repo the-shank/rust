@@ -31,7 +31,7 @@ use thin_vec::{thin_vec, ThinVec};
 use tracing::debug;
 
 use crate::errors::{
-    AddedMacroUse, ChangeImportBinding, ChangeImportBindingSuggestion, ConsiderAddingADerive,
+    self, AddedMacroUse, ChangeImportBinding, ChangeImportBindingSuggestion, ConsiderAddingADerive,
     ExplicitUnsafeTraits, MacroDefinedLater, MacroSuggMovePosition, MaybeMissingMacroRulesName,
 };
 
