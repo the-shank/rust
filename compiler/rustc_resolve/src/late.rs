@@ -4843,7 +4843,7 @@ impl<'ast> Visitor<'ast> for ItemInfoCollector<'_, '_, '_> {
 }
 
 impl<'a, 'tcx> Resolver<'a, 'tcx> {
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     pub(crate) fn late_resolve_crate(&mut self, krate: &Crate) {
         visit::walk_crate(&mut ItemInfoCollector { r: self }, krate);
         let mut late_resolution_visitor = LateResolutionVisitor::new(self);
