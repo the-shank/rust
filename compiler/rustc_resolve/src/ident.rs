@@ -292,6 +292,8 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         ribs: &[Rib<'a>],
         ignore_binding: Option<NameBinding<'a>>,
     ) -> Option<LexicalScopeBinding<'a>> {
+        // shank:
+        debug!(">> \n{:?}", std::backtrace::Backtrace::capture());
         assert!(ns == TypeNS || ns == ValueNS);
         let orig_ident = ident;
         if ident.name == kw::Empty {
