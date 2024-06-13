@@ -1823,6 +1823,9 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         module: Module<'a>,
         key: BindingKey,
     ) -> &'a RefCell<NameResolution<'a>> {
+        // shank
+        debug!(">> module.def_id() : {:?}", module.opt_def_id());
+
         *self
             .resolutions(module)
             .borrow_mut()

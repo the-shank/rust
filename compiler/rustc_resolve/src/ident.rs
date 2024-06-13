@@ -292,8 +292,6 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         ribs: &[Rib<'a>],
         ignore_binding: Option<NameBinding<'a>>,
     ) -> Option<LexicalScopeBinding<'a>> {
-        // shank:
-        debug!(">> \n{}", std::backtrace::Backtrace::capture());
         assert!(ns == TypeNS || ns == ValueNS);
         let orig_ident = ident;
         if ident.name == kw::Empty {
@@ -891,7 +889,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         let key = BindingKey::new(ident, ns);
         let resolution =
             self.resolution(module, key).try_borrow_mut().map_err(|_| (Determined, Weak::No))?; // This happens when there is a cycle of imports.
-        debug!("resolution: {:?}", resolution);
+        debug!(">> resolution:\n{:#?}", resolution);
 
         // If the primary binding is unusable, search further and return the shadowed glob
         // binding if it exists. What we really want here is having two separate scopes in
