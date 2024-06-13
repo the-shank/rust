@@ -61,6 +61,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use tracing::debug;
 
+use tracing::instrument;
+
 use diagnostics::{ImportSuggestion, LabelSuggestion, Suggestion};
 use effective_visibilities::EffectiveVisibilitiesVisitor;
 use errors::{
@@ -1806,6 +1808,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         BindingKey { ident, ns, disambiguator }
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     fn resolutions(&mut self, module: Module<'a>) -> &'a Resolutions<'a> {
         if module.populate_on_access.get() {
             module.populate_on_access.set(false);
@@ -1814,6 +1817,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         &module.0.0.lazy_resolutions
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     fn resolution(
         &mut self,
         module: Module<'a>,

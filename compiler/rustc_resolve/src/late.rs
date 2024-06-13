@@ -1370,6 +1370,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         )
     }
 
+    #[instrument(level = "debug", skip(self), ret)]
     fn resolve_path(
         &mut self,
         path: &[Segment],
@@ -3779,6 +3780,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
     // If resolution fails tries several techniques to find likely
     // resolution candidates, suggest imports or other help, and report
     // errors in user friendly way.
+    #[instrument(level = "debug", skip(self))]
     fn smart_resolve_path(
         &mut self,
         id: NodeId,
@@ -3795,8 +3797,10 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         );
     }
 
+    // >> resume-here
+    // >> this function is important
     // shank: (#useful) "smart" resolution of path fragment seems useful...
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self), ret)]
     fn smart_resolve_path_fragment(
         &mut self,
         qself: &Option<P<QSelf>>,
@@ -3808,6 +3812,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         let ns = source.namespace();
 
         let Finalize { node_id, path_span, .. } = finalize;
+        // shank: just declaring closure...
         let report_errors = |this: &mut Self, res: Option<Res>| {
             if this.should_report_errs() {
                 let (err, candidates) =
@@ -3855,6 +3860,8 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
 
             PartialRes::new(Res::Err)
         };
+
+        // shank: just declaraing another closure...
 
         // For paths originating from calls (like in `HashMap::new()`), tries
         // to enrich the plain `failed to resolve: ...` message with hints
@@ -4073,6 +4080,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
     }
 
     // Resolve in alternative namespaces if resolution in the primary namespace fails.
+    #[instrument(level = "debug", skip(self), ret)]
     fn resolve_qpath_anywhere(
         &mut self,
         qself: &Option<P<QSelf>>,
@@ -4117,6 +4125,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
     }
 
     /// Handles paths that may refer to associated items.
+    #[instrument(level = "debug", skip(self), ret)]
     fn resolve_qpath(
         &mut self,
         qself: &Option<P<QSelf>>,
