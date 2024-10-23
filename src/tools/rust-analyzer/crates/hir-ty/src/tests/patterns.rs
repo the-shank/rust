@@ -57,6 +57,7 @@ fn infer_pattern() {
             101..151 'for (e...     }': ()
             101..151 'for (e...     }': ()
             101..151 'for (e...     }': ()
+            101..151 'for (e...     }': ()
             105..111 '(e, f)': ({unknown}, {unknown})
             106..107 'e': {unknown}
             109..110 'f': {unknown}
@@ -111,8 +112,10 @@ fn infer_literal_pattern() {
             if let "foo" = any() {}
             if let 1 = any() {}
             if let 1u32 = any() {}
+            if let 1f16 = any() {}
             if let 1f32 = any() {}
             if let 1.0 = any() {}
+            if let 1f128 = any() {}
             if let true = any() {}
         }
         "#,
@@ -121,7 +124,7 @@ fn infer_literal_pattern() {
             19..26 'loop {}': !
             24..26 '{}': ()
             37..38 'x': &'? i32
-            46..208 '{     ...) {} }': ()
+            46..263 '{     ...) {} }': ()
             52..75 'if let...y() {}': ()
             55..72 'let "f... any()': bool
             59..64 '"foo"': &'static str
@@ -145,25 +148,39 @@ fn infer_literal_pattern() {
             124..126 '{}': ()
             131..153 'if let...y() {}': ()
             134..150 'let 1f... any()': bool
-            138..142 '1f32': f32
-            138..142 '1f32': f32
-            145..148 'any': fn any<f32>() -> f32
-            145..150 'any()': f32
+            138..142 '1f16': f16
+            138..142 '1f16': f16
+            145..148 'any': fn any<f16>() -> f16
+            145..150 'any()': f16
             151..153 '{}': ()
-            158..179 'if let...y() {}': ()
-            161..176 'let 1.0 = any()': bool
-            165..168 '1.0': f64
-            165..168 '1.0': f64
-            171..174 'any': fn any<f64>() -> f64
-            171..176 'any()': f64
-            177..179 '{}': ()
-            184..206 'if let...y() {}': ()
-            187..203 'let tr... any()': bool
-            191..195 'true': bool
-            191..195 'true': bool
-            198..201 'any': fn any<bool>() -> bool
-            198..203 'any()': bool
+            158..180 'if let...y() {}': ()
+            161..177 'let 1f... any()': bool
+            165..169 '1f32': f32
+            165..169 '1f32': f32
+            172..175 'any': fn any<f32>() -> f32
+            172..177 'any()': f32
+            178..180 '{}': ()
+            185..206 'if let...y() {}': ()
+            188..203 'let 1.0 = any()': bool
+            192..195 '1.0': f64
+            192..195 '1.0': f64
+            198..201 'any': fn any<f64>() -> f64
+            198..203 'any()': f64
             204..206 '{}': ()
+            211..234 'if let...y() {}': ()
+            214..231 'let 1f... any()': bool
+            218..223 '1f128': f128
+            218..223 '1f128': f128
+            226..229 'any': fn any<f128>() -> f128
+            226..231 'any()': f128
+            232..234 '{}': ()
+            239..261 'if let...y() {}': ()
+            242..258 'let tr... any()': bool
+            246..250 'true': bool
+            246..250 'true': bool
+            253..256 'any': fn any<bool>() -> bool
+            253..258 'any()': bool
+            259..261 '{}': ()
         "#]],
     );
 }
@@ -210,13 +227,13 @@ fn infer_pattern_match_ergonomics() {
             37..41 'A(n)': A<i32>
             39..40 'n': &'? i32
             44..49 '&A(1)': &'? A<i32>
-            45..46 'A': extern "rust-call" A<i32>(i32) -> A<i32>
+            45..46 'A': fn A<i32>(i32) -> A<i32>
             45..49 'A(1)': A<i32>
             47..48 '1': i32
             59..63 'A(n)': A<i32>
             61..62 'n': &'? mut i32
             66..75 '&mut A(1)': &'? mut A<i32>
-            71..72 'A': extern "rust-call" A<i32>(i32) -> A<i32>
+            71..72 'A': fn A<i32>(i32) -> A<i32>
             71..75 'A(1)': A<i32>
             73..74 '1': i32
         "#]],
@@ -531,18 +548,18 @@ impl Foo {
             56..64 'Self(s,)': Foo
             61..62 's': &'? usize
             67..75 '&Foo(0,)': &'? Foo
-            68..71 'Foo': extern "rust-call" Foo(usize) -> Foo
+            68..71 'Foo': fn Foo(usize) -> Foo
             68..75 'Foo(0,)': Foo
             72..73 '0': usize
             89..97 'Self(s,)': Foo
             94..95 's': &'? mut usize
             100..112 '&mut Foo(0,)': &'? mut Foo
-            105..108 'Foo': extern "rust-call" Foo(usize) -> Foo
+            105..108 'Foo': fn Foo(usize) -> Foo
             105..112 'Foo(0,)': Foo
             109..110 '0': usize
             126..134 'Self(s,)': Foo
             131..132 's': usize
-            137..140 'Foo': extern "rust-call" Foo(usize) -> Foo
+            137..140 'Foo': fn Foo(usize) -> Foo
             137..144 'Foo(0,)': Foo
             141..142 '0': usize
         "#]],
@@ -916,7 +933,7 @@ fn foo(foo: Foo) {
             48..51 'foo': Foo
             62..84 'const ... 32) }': Foo
             68..84 '{ Foo(... 32) }': Foo
-            70..73 'Foo': extern "rust-call" Foo(usize) -> Foo
+            70..73 'Foo': fn Foo(usize) -> Foo
             70..82 'Foo(15 + 32)': Foo
             74..76 '15': usize
             74..81 '15 + 32': usize
@@ -1110,6 +1127,23 @@ fn var_args() {
 pub struct VaListImpl<'f>;
 fn my_fn(foo: ...) {}
        //^^^ VaListImpl<'?>
+fn my_fn2(bar: u32, foo: ...) {}
+                  //^^^ VaListImpl<'?>
+"#,
+    );
+}
+
+#[test]
+fn var_args_cond() {
+    check_types(
+        r#"
+#[lang = "va_list"]
+pub struct VaListImpl<'f>;
+fn my_fn(bar: u32, #[cfg(FALSE)] foo: ..., #[cfg(not(FALSE))] foo: u32) {
+    foo;
+  //^^^ u32
+
+}
 "#,
     );
 }

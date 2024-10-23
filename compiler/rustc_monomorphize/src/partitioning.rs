@@ -95,12 +95,13 @@
 use std::cmp;
 use std::collections::hash_map::Entry;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
+use rustc_hir::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdSet, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathDataName;
@@ -111,16 +112,17 @@ use rustc_middle::mir::mono::{
     CodegenUnit, CodegenUnitNameBuilder, InstantiationMode, Linkage, MonoItem, MonoItemData,
     Visibility,
 };
-use rustc_middle::query::Providers;
 use rustc_middle::ty::print::{characteristic_def_id_of_type, with_no_trimmed_paths};
-use rustc_middle::ty::{self, visit::TypeVisitableExt, InstanceDef, TyCtxt};
-use rustc_session::config::{DumpMonoStatsFormat, SwitchWithOptPath};
+use rustc_middle::ty::visit::TypeVisitableExt;
+use rustc_middle::ty::{self, InstanceKind, TyCtxt};
+use rustc_middle::util::Providers;
 use rustc_session::CodegenUnits;
+use rustc_session::config::{DumpMonoStatsFormat, SwitchWithOptPath};
 use rustc_span::symbol::Symbol;
+use rustc_target::spec::SymbolVisibility;
 use tracing::debug;
 
-use crate::collector::UsageMap;
-use crate::collector::{self, MonoItemCollectionStrategy};
+use crate::collector::{self, MonoItemCollectionStrategy, UsageMap};
 use crate::errors::{CouldntDumpMonoStats, SymbolAlreadyDefined, UnknownCguCollectionMode};
 
 struct PartitioningCx<'a, 'tcx> {
@@ -254,8 +256,12 @@ where
         }
         let size_estimate = mono_item.size_estimate(cx.tcx);
 
-        cgu.items_mut()
-            .insert(mono_item, MonoItemData { inlined: false, linkage, visibility, size_estimate });
+        cgu.items_mut().insert(mono_item, MonoItemData {
+            inlined: false,
+            linkage,
+            visibility,
+            size_estimate,
+        });
 
         // Get all inlined items that are reachable from `mono_item` without
         // going via another root item. This includes drop-glue, functions from
@@ -370,7 +376,7 @@ fn merge_codegen_units<'tcx>(
         // Move the items from `cgu_src` to `cgu_dst`. Some of them may be
         // duplicate inlined items, in which case the destination CGU is
         // unaffected. Recalculate size estimates afterwards.
-        cgu_dst.items_mut().extend(cgu_src.items_mut().drain(..));
+        cgu_dst.items_mut().append(cgu_src.items_mut());
         cgu_dst.compute_size_estimate();
 
         // Record that `cgu_dst` now contains all the stuff that was in
@@ -409,7 +415,7 @@ fn merge_codegen_units<'tcx>(
         // Move the items from `smallest` to `second_smallest`. Some of them
         // may be duplicate inlined items, in which case the destination CGU is
         // unaffected. Recalculate size estimates afterwards.
-        second_smallest.items_mut().extend(smallest.items_mut().drain(..));
+        second_smallest.items_mut().append(smallest.items_mut());
         second_smallest.compute_size_estimate();
 
         // Don't update `cgu_contents`, that's only for incremental builds.
@@ -503,10 +509,8 @@ fn compute_inlined_overlap<'tcx>(cgu1: &CodegenUnit<'tcx>, cgu2: &CodegenUnit<'t
 
     let mut overlap = 0;
     for (item, data) in src_cgu.items().iter() {
-        if data.inlined {
-            if dst_cgu.items().contains_key(item) {
-                overlap += data.size_estimate;
-            }
+        if data.inlined && dst_cgu.items().contains_key(item) {
+            overlap += data.size_estimate;
         }
     }
     overlap
@@ -619,20 +623,19 @@ fn characteristic_def_id_of_mono_item<'tcx>(
     match mono_item {
         MonoItem::Fn(instance) => {
             let def_id = match instance.def {
-                ty::InstanceDef::Item(def) => def,
-                ty::InstanceDef::VTableShim(..)
-                | ty::InstanceDef::ReifyShim(..)
-                | ty::InstanceDef::FnPtrShim(..)
-                | ty::InstanceDef::ClosureOnceShim { .. }
-                | ty::InstanceDef::ConstructCoroutineInClosureShim { .. }
-                | ty::InstanceDef::CoroutineKindShim { .. }
-                | ty::InstanceDef::Intrinsic(..)
-                | ty::InstanceDef::DropGlue(..)
-                | ty::InstanceDef::Virtual(..)
-                | ty::InstanceDef::CloneShim(..)
-                | ty::InstanceDef::ThreadLocalShim(..)
-                | ty::InstanceDef::FnPtrAddrShim(..)
-                | ty::InstanceDef::AsyncDropGlueCtorShim(..) => return None,
+                ty::InstanceKind::Item(def) => def,
+                ty::InstanceKind::VTableShim(..)
+                | ty::InstanceKind::ReifyShim(..)
+                | ty::InstanceKind::FnPtrShim(..)
+                | ty::InstanceKind::ClosureOnceShim { .. }
+                | ty::InstanceKind::ConstructCoroutineInClosureShim { .. }
+                | ty::InstanceKind::Intrinsic(..)
+                | ty::InstanceKind::DropGlue(..)
+                | ty::InstanceKind::Virtual(..)
+                | ty::InstanceKind::CloneShim(..)
+                | ty::InstanceKind::ThreadLocalShim(..)
+                | ty::InstanceKind::FnPtrAddrShim(..)
+                | ty::InstanceKind::AsyncDropGlueCtorShim(..) => return None,
             };
 
             // If this is a method, we want to put it into the same module as
@@ -647,7 +650,9 @@ fn characteristic_def_id_of_mono_item<'tcx>(
 
             if let Some(impl_def_id) = tcx.impl_of_method(def_id) {
                 if tcx.sess.opts.incremental.is_some()
-                    && tcx.trait_id_of_impl(impl_def_id) == tcx.lang_items().drop_trait()
+                    && tcx
+                        .trait_id_of_impl(impl_def_id)
+                        .is_some_and(|def_id| tcx.is_lang_item(def_id, LangItem::Drop))
                 {
                     // Put `Drop::drop` into the same cgu as `drop_in_place`
                     // since `drop_in_place` is the only thing that can
@@ -776,28 +781,27 @@ fn mono_item_visibility<'tcx>(
     };
 
     let def_id = match instance.def {
-        InstanceDef::Item(def_id)
-        | InstanceDef::DropGlue(def_id, Some(_))
-        | InstanceDef::AsyncDropGlueCtorShim(def_id, Some(_)) => def_id,
+        InstanceKind::Item(def_id)
+        | InstanceKind::DropGlue(def_id, Some(_))
+        | InstanceKind::AsyncDropGlueCtorShim(def_id, Some(_)) => def_id,
 
         // We match the visibility of statics here
-        InstanceDef::ThreadLocalShim(def_id) => {
+        InstanceKind::ThreadLocalShim(def_id) => {
             return static_visibility(tcx, can_be_internalized, def_id);
         }
 
         // These are all compiler glue and such, never exported, always hidden.
-        InstanceDef::VTableShim(..)
-        | InstanceDef::ReifyShim(..)
-        | InstanceDef::FnPtrShim(..)
-        | InstanceDef::Virtual(..)
-        | InstanceDef::Intrinsic(..)
-        | InstanceDef::ClosureOnceShim { .. }
-        | InstanceDef::ConstructCoroutineInClosureShim { .. }
-        | InstanceDef::CoroutineKindShim { .. }
-        | InstanceDef::DropGlue(..)
-        | InstanceDef::AsyncDropGlueCtorShim(..)
-        | InstanceDef::CloneShim(..)
-        | InstanceDef::FnPtrAddrShim(..) => return Visibility::Hidden,
+        InstanceKind::VTableShim(..)
+        | InstanceKind::ReifyShim(..)
+        | InstanceKind::FnPtrShim(..)
+        | InstanceKind::Virtual(..)
+        | InstanceKind::Intrinsic(..)
+        | InstanceKind::ClosureOnceShim { .. }
+        | InstanceKind::ConstructCoroutineInClosureShim { .. }
+        | InstanceKind::DropGlue(..)
+        | InstanceKind::AsyncDropGlueCtorShim(..)
+        | InstanceKind::CloneShim(..)
+        | InstanceKind::FnPtrAddrShim(..) => return Visibility::Hidden,
     };
 
     // The `start_fn` lang item is actually a monomorphized instance of a
@@ -812,8 +816,8 @@ fn mono_item_visibility<'tcx>(
     //        internalization, but we have to understand that it's referenced
     //        from the `main` symbol we'll generate later.
     //
-    //        This may be fixable with a new `InstanceDef` perhaps? Unsure!
-    if tcx.lang_items().start_fn() == Some(def_id) {
+    //        This may be fixable with a new `InstanceKind` perhaps? Unsure!
+    if tcx.is_lang_item(def_id, LangItem::Start) {
         *can_be_internalized = false;
         return Visibility::Hidden;
     }
@@ -901,26 +905,28 @@ fn mono_item_visibility<'tcx>(
 }
 
 fn default_visibility(tcx: TyCtxt<'_>, id: DefId, is_generic: bool) -> Visibility {
-    if !tcx.sess.default_hidden_visibility() {
+    // Fast-path to avoid expensive query call below
+    if tcx.sess.default_visibility() == SymbolVisibility::Interposable {
         return Visibility::Default;
     }
 
-    // Generic functions never have export-level C.
-    if is_generic {
-        return Visibility::Hidden;
-    }
+    let export_level = if is_generic {
+        // Generic functions never have export-level C.
+        SymbolExportLevel::Rust
+    } else {
+        match tcx.reachable_non_generics(id.krate).get(&id) {
+            Some(SymbolExportInfo { level: SymbolExportLevel::C, .. }) => SymbolExportLevel::C,
+            _ => SymbolExportLevel::Rust,
+        }
+    };
 
-    // Things with export level C don't get instantiated in
-    // downstream crates.
-    if !id.is_local() {
-        return Visibility::Hidden;
-    }
+    match export_level {
+        // C-export level items remain at `Default` to allow C code to
+        // access and interpose them.
+        SymbolExportLevel::C => Visibility::Default,
 
-    // C-export level items remain at `Default`, all other internal
-    // items become `Hidden`.
-    match tcx.reachable_non_generics(id.krate).get(&id) {
-        Some(SymbolExportInfo { level: SymbolExportLevel::C, .. }) => Visibility::Default,
-        _ => Visibility::Hidden,
+        // For all other symbols, `default_visibility` determines which visibility to use.
+        SymbolExportLevel::Rust => tcx.sess.default_visibility().into(),
     }
 }
 
@@ -1240,8 +1246,7 @@ fn dump_mono_items_stats<'tcx>(
     let ext = format.extension();
     let filename = format!("{crate_name}.mono_items.{ext}");
     let output_path = output_directory.join(&filename);
-    let file = File::create(&output_path)?;
-    let mut file = BufWriter::new(file);
+    let mut file = File::create_buffered(&output_path)?;
 
     // Gather instantiated mono items grouped by def_id
     let mut items_per_def_id: FxIndexMap<_, Vec<_>> = Default::default();
@@ -1299,7 +1304,7 @@ fn dump_mono_items_stats<'tcx>(
     Ok(())
 }
 
-pub fn provide(providers: &mut Providers) {
+pub(crate) fn provide(providers: &mut Providers) {
     providers.collect_and_partition_mono_items = collect_and_partition_mono_items;
 
     providers.is_codegened_item = |tcx, def_id| {
@@ -1313,4 +1318,6 @@ pub fn provide(providers: &mut Providers) {
             .find(|cgu| cgu.name() == name)
             .unwrap_or_else(|| panic!("failed to find cgu with name {name:?}"))
     };
+
+    collector::provide(providers);
 }

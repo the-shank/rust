@@ -14,49 +14,38 @@
 
 #![deny(warnings)]
 
-use run_make_support::object::read::archive::ArchiveFile;
-use run_make_support::object::read::Object;
-use run_make_support::object::ObjectSection;
-use run_make_support::object::ObjectSymbol;
-use run_make_support::object::RelocationTarget;
-use run_make_support::{cmd, env_var, object};
 use std::collections::HashSet;
-use std::path::PathBuf;
+
+use run_make_support::object::read::Object;
+use run_make_support::object::read::archive::ArchiveFile;
+use run_make_support::object::{ObjectSection, ObjectSymbol, RelocationTarget};
+use run_make_support::rfs::{read, read_dir};
+use run_make_support::{cargo, object, path, target};
 
 fn main() {
-    let target_dir = PathBuf::from("target");
-    let target = env_var("TARGET");
+    let target_dir = path("target");
 
-    println!("Testing compiler_builtins for {}", target);
+    println!("Testing compiler_builtins for {}", target());
 
-    let manifest_path = PathBuf::from("Cargo.toml");
+    cargo()
+        .args(&[
+            "build",
+            "--manifest-path",
+            "Cargo.toml",
+            "-Zbuild-std=core",
+            "--target",
+            &target(),
+        ])
+        .env("RUSTFLAGS", "-Copt-level=0 -Cdebug-assertions=yes")
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("RUSTC_BOOTSTRAP", "1")
+        // Visual Studio 2022 requires that the LIB env var be set so it can
+        // find the Windows SDK.
+        .env("LIB", std::env::var("LIB").unwrap_or_default())
+        .run();
 
-    let path = env_var("PATH");
-    let rustc = env_var("RUSTC");
-    let bootstrap_cargo = env_var("BOOTSTRAP_CARGO");
-    let mut cmd = cmd(bootstrap_cargo);
-    cmd.args([
-        "build",
-        "--manifest-path",
-        manifest_path.to_str().unwrap(),
-        "-Zbuild-std=core",
-        "--target",
-        &target,
-    ])
-    .env("PATH", path)
-    .env("RUSTC", rustc)
-    .env("RUSTFLAGS", "-Copt-level=0 -Cdebug-assertions=yes")
-    .env("CARGO_TARGET_DIR", &target_dir)
-    .env("RUSTC_BOOTSTRAP", "1")
-    // Visual Studio 2022 requires that the LIB env var be set so it can
-    // find the Windows SDK.
-    .env("LIB", std::env::var("LIB").unwrap_or_default());
-
-    cmd.run();
-
-    let rlibs_path = target_dir.join(target).join("debug").join("deps");
-    let compiler_builtins_rlib = std::fs::read_dir(rlibs_path)
-        .unwrap()
+    let rlibs_path = target_dir.join(target()).join("debug").join("deps");
+    let compiler_builtins_rlib = read_dir(rlibs_path)
         .find_map(|e| {
             let path = e.unwrap().path();
             let file_name = path.file_name().unwrap().to_str().unwrap();
@@ -70,7 +59,7 @@ fn main() {
 
     // rlib files are archives, where the archive members each a CGU, and we also have one called
     // lib.rmeta which is the encoded metadata. Each of the CGUs is an object file.
-    let data = std::fs::read(compiler_builtins_rlib).unwrap();
+    let data = read(compiler_builtins_rlib);
 
     let mut defined_symbols = HashSet::new();
     let mut undefined_relocations = HashSet::new();

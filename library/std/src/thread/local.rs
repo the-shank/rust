@@ -2,7 +2,7 @@
 
 #![unstable(feature = "thread_local_internals", issue = "none")]
 
-#[cfg(all(test, not(target_os = "emscripten")))]
+#[cfg(all(test, not(any(target_os = "emscripten", target_os = "wasi"))))]
 mod tests;
 
 #[cfg(test)]
@@ -62,7 +62,7 @@ use crate::fmt;
 /// FOO.set(2);
 ///
 /// // each thread starts out with the initial value of 1
-/// let t = thread::spawn(move|| {
+/// let t = thread::spawn(move || {
 ///     assert_eq!(FOO.get(), 1);
 ///     FOO.set(3);
 /// });

@@ -6,7 +6,8 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/borrow_check.html
 
-use rustc_ast::visit::visit_opt;
+use std::mem;
+
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
@@ -17,13 +18,10 @@ use rustc_middle::bug;
 use rustc_middle::middle::region::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::source_map;
-
-use super::errs::{maybe_expr_static_mut, maybe_stmt_static_mut};
-
-use std::mem;
+use tracing::debug;
 
 #[derive(Debug, Copy, Clone)]
-pub struct Context {
+struct Context {
     /// The scope that contains any new variables declared, plus its depth in
     /// the scope tree.
     var_parent: Option<(Scope, ScopeDepth)>,
@@ -168,7 +166,14 @@ fn resolve_block<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, blk: &'tcx h
                 hir::StmtKind::Expr(..) | hir::StmtKind::Semi(..) => visitor.visit_stmt(statement),
             }
         }
-        visit_opt!(visitor, visit_expr, &blk.expr);
+        if let Some(tail_expr) = blk.expr {
+            if visitor.tcx.features().shorter_tail_lifetimes()
+                && blk.span.edition().at_least_rust_2024()
+            {
+                visitor.terminating_scopes.insert(tail_expr.hir_id.local_id);
+            }
+            visitor.visit_expr(tail_expr);
+        }
     }
 
     visitor.cx = prev_cx;
@@ -222,8 +227,6 @@ fn resolve_stmt<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, stmt: &'tcx h
     let stmt_id = stmt.hir_id.local_id;
     debug!("resolve_stmt(stmt.id={:?})", stmt_id);
 
-    maybe_stmt_static_mut(visitor.tcx, *stmt);
-
     // Every statement will clean up the temporaries created during
     // execution of that statement. Therefore each statement has an
     // associated destruction scope that represents the scope of the
@@ -241,8 +244,6 @@ fn resolve_stmt<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, stmt: &'tcx h
 
 fn resolve_expr<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
     debug!("resolve_expr - pre-increment {} expr = {:?}", visitor.expr_and_pat_count, expr);
-
-    maybe_expr_static_mut(visitor.tcx, *expr);
 
     let prev_cx = visitor.cx;
     visitor.enter_node_scope_with_dtor(expr.hir_id.local_id);
@@ -465,7 +466,13 @@ fn resolve_expr<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, expr: &'tcx h
 
         hir::ExprKind::If(cond, then, Some(otherwise)) => {
             let expr_cx = visitor.cx;
-            visitor.enter_scope(Scope { id: then.hir_id.local_id, data: ScopeData::IfThen });
+            let data = if expr.span.at_least_rust_2024() && visitor.tcx.features().if_let_rescope()
+            {
+                ScopeData::IfThenRescope
+            } else {
+                ScopeData::IfThen
+            };
+            visitor.enter_scope(Scope { id: then.hir_id.local_id, data });
             visitor.cx.var_parent = visitor.cx.parent;
             visitor.visit_expr(cond);
             visitor.visit_expr(then);
@@ -475,7 +482,13 @@ fn resolve_expr<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, expr: &'tcx h
 
         hir::ExprKind::If(cond, then, None) => {
             let expr_cx = visitor.cx;
-            visitor.enter_scope(Scope { id: then.hir_id.local_id, data: ScopeData::IfThen });
+            let data = if expr.span.at_least_rust_2024() && visitor.tcx.features().if_let_rescope()
+            {
+                ScopeData::IfThenRescope
+            } else {
+                ScopeData::IfThen
+            };
+            visitor.enter_scope(Scope { id: then.hir_id.local_id, data });
             visitor.cx.var_parent = visitor.cx.parent;
             visitor.visit_expr(cond);
             visitor.visit_expr(then);
@@ -887,7 +900,7 @@ impl<'tcx> Visitor<'tcx> for RegionResolutionVisitor<'tcx> {
 /// re-use in incremental scenarios. We may sometimes need to rerun the
 /// type checker even when the HIR hasn't changed, and in those cases
 /// we can avoid reconstructing the region scope tree.
-pub fn region_scope_tree(tcx: TyCtxt<'_>, def_id: DefId) -> &ScopeTree {
+pub(crate) fn region_scope_tree(tcx: TyCtxt<'_>, def_id: DefId) -> &ScopeTree {
     let typeck_root_def_id = tcx.typeck_root_def_id(def_id);
     if typeck_root_def_id != def_id {
         return tcx.region_scope_tree(typeck_root_def_id);

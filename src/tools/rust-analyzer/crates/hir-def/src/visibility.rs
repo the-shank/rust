@@ -2,6 +2,7 @@
 
 use std::iter;
 
+use intern::Interned;
 use la_arena::ArenaMap;
 use span::SyntaxContextId;
 use syntax::ast;
@@ -20,15 +21,15 @@ use crate::{
 pub enum RawVisibility {
     /// `pub(in module)`, `pub(crate)` or `pub(super)`. Also private, which is
     /// equivalent to `pub(self)`.
-    Module(ModPath, VisibilityExplicitness),
+    Module(Interned<ModPath>, VisibilityExplicitness),
     /// `pub`.
     Public,
 }
 
 impl RawVisibility {
-    pub(crate) const fn private() -> RawVisibility {
+    pub(crate) fn private() -> RawVisibility {
         RawVisibility::Module(
-            ModPath::from_kind(PathKind::Super(0)),
+            Interned::new(ModPath::from_kind(PathKind::SELF)),
             VisibilityExplicitness::Implicit,
         )
     }
@@ -60,10 +61,10 @@ impl RawVisibility {
             }
             ast::VisibilityKind::PubCrate => ModPath::from_kind(PathKind::Crate),
             ast::VisibilityKind::PubSuper => ModPath::from_kind(PathKind::Super(1)),
-            ast::VisibilityKind::PubSelf => ModPath::from_kind(PathKind::Super(0)),
+            ast::VisibilityKind::PubSelf => ModPath::from_kind(PathKind::SELF),
             ast::VisibilityKind::Pub => return RawVisibility::Public,
         };
-        RawVisibility::Module(path, VisibilityExplicitness::Explicit)
+        RawVisibility::Module(Interned::new(path), VisibilityExplicitness::Explicit)
     }
 
     pub fn resolve(
@@ -138,13 +139,11 @@ impl Visibility {
         let def_map_block = def_map.block_id();
         loop {
             match (to_module.block, def_map_block) {
-                // to_module is not a block, so there is no parent def map to use
+                // `to_module` is not a block, so there is no parent def map to use.
                 (None, _) => (),
+                // `to_module` is at `def_map`'s block, no need to move further.
                 (Some(a), Some(b)) if a == b => {
                     cov_mark::hit!(is_visible_from_same_block_def_map);
-                    if let Some(parent) = def_map.parent() {
-                        to_module = parent;
-                    }
                 }
                 _ => {
                     if let Some(parent) = to_module.def_map(db).parent() {

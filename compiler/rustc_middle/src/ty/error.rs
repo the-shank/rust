@@ -1,5 +1,6 @@
-use crate::ty::print::{with_forced_trimmed_paths, FmtPrinter, PrettyPrinter};
-use crate::ty::{self, Ty, TyCtxt};
+use std::borrow::Cow;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::PathBuf;
 
 use rustc_errors::pluralize;
 use rustc_hir as hir;
@@ -7,9 +8,8 @@ use rustc_hir::def::{CtorOf, DefKind};
 use rustc_macros::extension;
 pub use rustc_type_ir::error::ExpectedFound;
 
-use std::borrow::Cow;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::PathBuf;
+use crate::ty::print::{FmtPrinter, PrettyPrinter, with_forced_trimmed_paths};
+use crate::ty::{self, Ty, TyCtxt};
 
 pub type TypeError<'tcx> = rustc_type_ir::error::TypeError<TyCtxt<'tcx>>;
 
@@ -35,9 +35,6 @@ impl<'tcx> TypeError<'tcx> {
             TypeError::CyclicTy(_) => "cyclic type of infinite size".into(),
             TypeError::CyclicConst(_) => "encountered a self-referencing constant".into(),
             TypeError::Mismatch => "types differ".into(),
-            TypeError::ConstnessMismatch(values) => {
-                format!("expected {} bound, found {} bound", values.expected, values.found).into()
-            }
             TypeError::PolarityMismatch(values) => {
                 format!("expected {} polarity, found {} polarity", values.expected, values.found)
                     .into()
@@ -130,7 +127,7 @@ impl<'tcx> Ty<'tcx> {
                 DefKind::Ctor(CtorOf::Variant, _) => "enum constructor".into(),
                 _ => "fn item".into(),
             },
-            ty::FnPtr(_) => "fn pointer".into(),
+            ty::FnPtr(..) => "fn pointer".into(),
             ty::Dynamic(inner, ..) if let Some(principal) = inner.principal() => {
                 format!("`dyn {}`", tcx.def_path_str(principal.def_id())).into()
             }
@@ -194,7 +191,7 @@ impl<'tcx> Ty<'tcx> {
                 DefKind::Ctor(CtorOf::Variant, _) => "enum constructor".into(),
                 _ => "fn item".into(),
             },
-            ty::FnPtr(_) => "fn pointer".into(),
+            ty::FnPtr(..) => "fn pointer".into(),
             ty::Dynamic(..) => "trait object".into(),
             ty::Closure(..) | ty::CoroutineClosure(..) => "closure".into(),
             ty::Coroutine(def_id, ..) => {

@@ -1,8 +1,9 @@
 //@ only-wasm32-wasip1
 
-use run_make_support::{rustc, wasmparser};
 use std::collections::HashMap;
 use std::path::Path;
+
+use run_make_support::{rfs, rustc, wasmparser};
 use wasmparser::ExternalKind::*;
 
 fn main() {
@@ -19,21 +20,18 @@ fn test(args: &[&str]) {
     rustc().input("main.rs").target("wasm32-wasip1").args(args).run();
 
     verify_exports(Path::new("foo.wasm"), &[("foo", Func), ("FOO", Global), ("memory", Memory)]);
-    verify_exports(
-        Path::new("main.wasm"),
-        &[
-            ("foo", Func),
-            ("FOO", Global),
-            ("_start", Func),
-            ("__main_void", Func),
-            ("memory", Memory),
-        ],
-    );
+    verify_exports(Path::new("main.wasm"), &[
+        ("foo", Func),
+        ("FOO", Global),
+        ("_start", Func),
+        ("__main_void", Func),
+        ("memory", Memory),
+    ]);
 }
 
 fn verify_exports(path: &Path, exports: &[(&str, wasmparser::ExternalKind)]) {
     println!("verify {path:?}");
-    let file = std::fs::read(path).unwrap();
+    let file = rfs::read(path);
     let mut wasm_exports = HashMap::new();
     for payload in wasmparser::Parser::new(0).parse_all(&file) {
         let payload = payload.unwrap();

@@ -19,7 +19,7 @@ if [ "$NO_CHANGE_USER" = "" ]; then
     # already be running with the right user.
     #
     # For NO_CHANGE_USER done in the small number of Dockerfiles affected.
-    echo -e '[safe]\n\tdirectory = *' > /home/user/gitconfig
+    echo -e '[safe]\n\tdirectory = *' > /home/user/.gitconfig
 
     exec su --preserve-environment -c "env PATH=$PATH \"$0\"" user
   fi
@@ -50,6 +50,13 @@ export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 # suppress change-tracker warnings on CI
 if [ "$CI" != "" ]; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set change-id=99999999"
+fi
+
+# If runner uses an incompatible option and `FORCE_CI_RUSTC` is not defined,
+# switch to in-tree rustc.
+if [ "$FORCE_CI_RUSTC" == "" ]; then
+    echo 'debug: `DISABLE_CI_RUSTC_IF_INCOMPATIBLE` configured.'
+    DISABLE_CI_RUSTC_IF_INCOMPATIBLE=1
 fi
 
 if ! isCI || isCiBranch auto || isCiBranch beta || isCiBranch try || isCiBranch try-perf || \
@@ -84,6 +91,10 @@ fi
 # process by recompressing the existing xz ones. This decreases the storage
 # space required for CI artifacts.
 RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --dist-compression-formats=xz"
+
+if [ "$EXTERNAL_LLVM" = "1" ]; then
+  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.lld=false"
+fi
 
 # Enable the `c` feature for compiler_builtins, but only when the `compiler-rt` source is available
 # (to avoid spending a lot of time cloning llvm)
@@ -165,9 +176,15 @@ else
   if [ "$NO_DOWNLOAD_CI_LLVM" = "" ]; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set llvm.download-ci-llvm=if-unchanged"
   else
+    # CI rustc requires CI LLVM to be enabled (see https://github.com/rust-lang/rust/issues/123586).
+    NO_DOWNLOAD_CI_RUSTC=1
     # When building for CI we want to use the static C++ Standard library
     # included with LLVM, since a dynamic libstdcpp may not be available.
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set llvm.static-libstdcpp"
+  fi
+
+  if [ "$NO_DOWNLOAD_CI_RUSTC" = "" ]; then
+    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.download-rustc=if-unchanged"
   fi
 fi
 

@@ -3,7 +3,6 @@
 //! [rustc-dev-guide]: https://rustc-dev-guide.rust-lang.org/traits/resolution.html
 
 mod engine;
-pub mod error_reporting;
 mod project;
 mod structural_impls;
 pub mod util;
@@ -15,21 +14,20 @@ use hir::def_id::LocalDefId;
 use rustc_hir as hir;
 use rustc_middle::traits::query::NoSolution;
 use rustc_middle::traits::solve::Certainty;
+pub use rustc_middle::traits::*;
 use rustc_middle::ty::{self, Ty, TyCtxt, Upcast};
 use rustc_span::Span;
+use thin_vec::ThinVec;
 
 pub use self::ImplSource::*;
 pub use self::SelectionError::*;
-use crate::infer::InferCtxt;
-
 pub use self::engine::{FromSolverError, ScrubbedTraitError, TraitEngine};
-pub use self::project::MismatchedProjectionTypes;
 pub(crate) use self::project::UndoLog;
 pub use self::project::{
-    Normalized, NormalizedTerm, ProjectionCache, ProjectionCacheEntry, ProjectionCacheKey,
-    ProjectionCacheStorage, Reveal,
+    MismatchedProjectionTypes, Normalized, NormalizedTerm, ProjectionCache, ProjectionCacheEntry,
+    ProjectionCacheKey, ProjectionCacheStorage,
 };
-pub use rustc_middle::traits::*;
+use crate::infer::InferCtxt;
 
 /// An `Obligation` represents some trait reference (e.g., `i32: Eq`) for
 /// which the "impl_source" must be found. The process of finding an "impl_source" is
@@ -87,6 +85,8 @@ pub type PredicateObligation<'tcx> = Obligation<'tcx, ty::Predicate<'tcx>>;
 pub type TraitObligation<'tcx> = Obligation<'tcx, ty::TraitPredicate<'tcx>>;
 pub type PolyTraitObligation<'tcx> = Obligation<'tcx, ty::PolyTraitPredicate<'tcx>>;
 
+pub type PredicateObligations<'tcx> = ThinVec<PredicateObligation<'tcx>>;
+
 impl<'tcx> PredicateObligation<'tcx> {
     /// Flips the polarity of the inner predicate.
     ///
@@ -113,8 +113,6 @@ impl<'tcx> PolyTraitObligation<'tcx> {
 // `PredicateObligation` is used a lot. Make sure it doesn't unintentionally get bigger.
 #[cfg(target_pointer_width = "64")]
 rustc_data_structures::static_assert_size!(PredicateObligation<'_>, 48);
-
-pub type PredicateObligations<'tcx> = Vec<PredicateObligation<'tcx>>;
 
 pub type Selection<'tcx> = ImplSource<'tcx, PredicateObligation<'tcx>>;
 

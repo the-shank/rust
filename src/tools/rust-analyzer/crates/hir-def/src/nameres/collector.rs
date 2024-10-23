@@ -5,23 +5,23 @@
 
 use std::{cmp::Ordering, iter, mem, ops::Not};
 
-use base_db::{CrateId, CrateOrigin, Dependency, FileId, LangCrateOrigin};
-use cfg::{CfgExpr, CfgOptions};
+use base_db::{CrateId, CrateOrigin, Dependency, LangCrateOrigin};
+use cfg::{CfgAtom, CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
     attrs::{Attr, AttrId},
-    builtin_attr_macro::{find_builtin_attr, BuiltinAttrExpander},
-    builtin_derive_macro::find_builtin_derive,
-    builtin_fn_macro::find_builtin_macro,
-    name::{name, AsName, Name},
+    builtin::{find_builtin_attr, find_builtin_derive, find_builtin_macro},
+    name::{AsName, Name},
     proc_macro::CustomProcMacroExpander,
     ExpandTo, HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefId, MacroDefKind,
+    MacroFileIdExt,
 };
+use intern::{sym, Interned};
 use itertools::{izip, Itertools};
 use la_arena::Idx;
 use limit::Limit;
 use rustc_hash::{FxHashMap, FxHashSet};
-use span::{Edition, ErasedFileAstId, FileAstId, Span, SyntaxContextId};
+use span::{Edition, EditionedFileId, FileAstId, SyntaxContextId};
 use syntax::ast;
 use triomphe::Arc;
 
@@ -30,8 +30,8 @@ use crate::{
     db::DefDatabase,
     item_scope::{ImportId, ImportOrExternCrate, ImportType, PerNsGlobImports},
     item_tree::{
-        self, ExternCrate, Fields, FileItemTreeId, ImportKind, ItemTree, ItemTreeId, ItemTreeNode,
-        Macro2, MacroCall, MacroRules, Mod, ModItem, ModKind, TreeId,
+        self, AttrOwner, FieldsShape, FileItemTreeId, ImportKind, ItemTree, ItemTreeId,
+        ItemTreeNode, Macro2, MacroCall, MacroRules, Mod, ModItem, ModKind, TreeId,
     },
     macro_call_as_call_id, macro_call_as_call_id_with_eager,
     nameres::{
@@ -56,7 +56,6 @@ use crate::{
 };
 
 static GLOB_RECURSION_LIMIT: Limit = Limit::new(100);
-static EXPANSION_DEPTH_LIMIT: Limit = Limit::new(128);
 static FIXED_POINT_LIMIT: Limit = Limit::new(8192);
 
 pub(super) fn collect_defs(db: &dyn DefDatabase, def_map: DefMap, tree_id: TreeId) -> DefMap {
@@ -74,42 +73,11 @@ pub(super) fn collect_defs(db: &dyn DefDatabase, def_map: DefMap, tree_id: TreeI
     }
 
     let proc_macros = if krate.is_proc_macro {
-        match db.proc_macros().get(&def_map.krate) {
-            Some(Ok(proc_macros)) => {
-                Ok(proc_macros
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, it)| {
-                        // FIXME: a hacky way to create a Name from string.
-                        let name = tt::Ident {
-                            text: it.name.clone(),
-                            span: Span {
-                                range: syntax::TextRange::empty(syntax::TextSize::new(0)),
-                                anchor: span::SpanAnchor {
-                                    file_id: FileId::BOGUS,
-                                    ast_id: span::ROOT_ERASED_FILE_AST_ID,
-                                },
-                                ctx: SyntaxContextId::ROOT,
-                            },
-                        };
-                        (
-                            name.as_name(),
-                            if it.disabled {
-                                CustomProcMacroExpander::disabled()
-                            } else {
-                                CustomProcMacroExpander::new(
-                                    hir_expand::proc_macro::ProcMacroId::new(idx as u32),
-                                )
-                            },
-                        )
-                    })
-                    .collect())
-            }
-            Some(Err(e)) => Err(e.clone().into_boxed_str()),
-            None => Err("No proc-macros present for crate".to_owned().into_boxed_str()),
-        }
+        db.proc_macros()
+            .for_crate(def_map.krate, db.syntax_context(tree_id.file_id()))
+            .unwrap_or_default()
     } else {
-        Ok(vec![])
+        Default::default()
     };
 
     let mut collector = DefCollector {
@@ -125,6 +93,7 @@ pub(super) fn collect_defs(db: &dyn DefDatabase, def_map: DefMap, tree_id: TreeI
         proc_macros,
         from_glob_import: Default::default(),
         skip_attrs: Default::default(),
+        unresolved_extern_crates: Default::default(),
         is_proc_macro: krate.is_proc_macro,
     };
     if tree_id.is_block() {
@@ -158,9 +127,11 @@ impl PartialResolvedImport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ImportSource {
-    Use { use_tree: Idx<ast::UseTree>, id: UseId, is_prelude: bool, kind: ImportKind },
-    ExternCrate { id: ExternCrateId },
+struct ImportSource {
+    use_tree: Idx<ast::UseTree>,
+    id: UseId,
+    is_prelude: bool,
+    kind: ImportKind,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -186,24 +157,9 @@ impl Import {
                 path,
                 alias,
                 visibility: visibility.clone(),
-                source: ImportSource::Use { use_tree: idx, id, is_prelude, kind },
+                source: ImportSource { use_tree: idx, id, is_prelude, kind },
             });
         });
-    }
-
-    fn from_extern_crate(
-        tree: &ItemTree,
-        item_tree_id: ItemTreeId<item_tree::ExternCrate>,
-        id: ExternCrateId,
-    ) -> Self {
-        let it = &tree[item_tree_id.value];
-        let visibility = &tree[it.visibility];
-        Self {
-            path: ModPath::from_segments(PathKind::Plain, iter::once(it.name.clone())),
-            alias: it.alias.clone(),
-            visibility: visibility.clone(),
-            source: ImportSource::ExternCrate { id },
-        }
     }
 }
 
@@ -250,18 +206,23 @@ enum MacroDirectiveKind {
 struct DefCollector<'a> {
     db: &'a dyn DefDatabase,
     def_map: DefMap,
+    // The dependencies of the current crate, including optional deps like `test`.
     deps: FxHashMap<Name, Dependency>,
     glob_imports: FxHashMap<LocalModuleId, Vec<(LocalModuleId, Visibility, UseId)>>,
     unresolved_imports: Vec<ImportDirective>,
-    indeterminate_imports: Vec<ImportDirective>,
+    indeterminate_imports: Vec<(ImportDirective, PerNs)>,
     unresolved_macros: Vec<MacroDirective>,
+    // We'd like to avoid emitting a diagnostics avalanche when some `extern crate` doesn't
+    // resolve. When we emit diagnostics for unresolved imports, we only do so if the import
+    // doesn't start with an unresolved crate's name.
+    unresolved_extern_crates: FxHashSet<Name>,
     mod_dirs: FxHashMap<LocalModuleId, ModDir>,
     cfg_options: &'a CfgOptions,
     /// List of procedural macros defined by this crate. This is read from the dynamic library
-    /// built by the build system, and is the list of proc. macros we can actually expand. It is
-    /// empty when proc. macro support is disabled (in which case we still do name resolution for
-    /// them).
-    proc_macros: Result<Vec<(Name, CustomProcMacroExpander)>, Box<str>>,
+    /// built by the build system, and is the list of proc-macros we can actually expand. It is
+    /// empty when proc-macro support is disabled (in which case we still do name resolution for
+    /// them). The bool signals whether the proc-macro has been explicitly disabled for name-resolution.
+    proc_macros: Box<[(Name, CustomProcMacroExpander, bool)]>,
     is_proc_macro: bool,
     from_glob_import: PerNsGlobImports,
     /// If we fail to resolve an attribute on a `ModItem`, we fall back to ignoring the attribute.
@@ -270,22 +231,19 @@ struct DefCollector<'a> {
     ///
     /// This also stores the attributes to skip when we resolve derive helpers and non-macro
     /// non-builtin attributes in general.
+    // FIXME: There has to be a better way to do this
     skip_attrs: FxHashMap<InFile<ModItem>, AttrId>,
 }
 
 impl DefCollector<'_> {
     fn seed_with_top_level(&mut self) {
-        let _p = tracing::span!(tracing::Level::INFO, "seed_with_top_level").entered();
+        let _p = tracing::info_span!("seed_with_top_level").entered();
 
         let crate_graph = self.db.crate_graph();
-        let file_id = crate_graph[self.def_map.krate].root_file_id;
+        let file_id = crate_graph[self.def_map.krate].root_file_id();
         let item_tree = self.db.file_item_tree(file_id.into());
         let attrs = item_tree.top_level_attrs(self.db, self.def_map.krate);
         let crate_data = Arc::get_mut(&mut self.def_map.data).unwrap();
-
-        if let Err(e) = &self.proc_macros {
-            crate_data.proc_macro_loading_error = Some(e.clone());
-        }
 
         let mut process = true;
 
@@ -300,43 +258,43 @@ impl DefCollector<'_> {
             let Some(attr_name) = attr.path.as_ident() else { continue };
 
             match () {
-                () if *attr_name == hir_expand::name![recursion_limit] => {
+                () if *attr_name == sym::recursion_limit.clone() => {
                     if let Some(limit) = attr.string_value() {
-                        if let Ok(limit) = limit.parse() {
+                        if let Ok(limit) = limit.as_str().parse() {
                             crate_data.recursion_limit = Some(limit);
                         }
                     }
                 }
-                () if *attr_name == hir_expand::name![crate_type] => {
-                    if let Some("proc-macro") = attr.string_value() {
+                () if *attr_name == sym::crate_type.clone() => {
+                    if attr.string_value() == Some(&sym::proc_dash_macro) {
                         self.is_proc_macro = true;
                     }
                 }
-                () if *attr_name == hir_expand::name![no_core] => crate_data.no_core = true,
-                () if *attr_name == hir_expand::name![no_std] => crate_data.no_std = true,
-                () if attr_name.as_text().as_deref() == Some("rustc_coherence_is_core") => {
+                () if *attr_name == sym::no_core.clone() => crate_data.no_core = true,
+                () if *attr_name == sym::no_std.clone() => crate_data.no_std = true,
+                () if *attr_name == sym::rustc_coherence_is_core.clone() => {
                     crate_data.rustc_coherence_is_core = true;
                 }
-                () if *attr_name == hir_expand::name![feature] => {
+                () if *attr_name == sym::feature.clone() => {
                     let features = attr
                         .parse_path_comma_token_tree(self.db.upcast())
                         .into_iter()
                         .flatten()
                         .filter_map(|(feat, _)| match feat.segments() {
-                            [name] => Some(name.to_smol_str()),
+                            [name] => Some(name.symbol().clone()),
                             _ => None,
                         });
                     crate_data.unstable_features.extend(features);
                 }
-                () if *attr_name == hir_expand::name![register_attr] => {
+                () if *attr_name == sym::register_attr.clone() => {
                     if let Some(ident) = attr.single_ident_value() {
-                        crate_data.registered_attrs.push(ident.text.clone());
+                        crate_data.registered_attrs.push(ident.sym.clone());
                         cov_mark::hit!(register_attr);
                     }
                 }
-                () if *attr_name == hir_expand::name![register_tool] => {
+                () if *attr_name == sym::register_tool.clone() => {
                     if let Some(ident) = attr.single_ident_value() {
-                        crate_data.registered_tools.push(ident.text.clone());
+                        crate_data.registered_tools.push(ident.sym.clone());
                         cov_mark::hit!(register_tool);
                     }
                 }
@@ -345,6 +303,7 @@ impl DefCollector<'_> {
         }
 
         for (name, dep) in &self.deps {
+            // Add all
             if dep.is_prelude() {
                 // This is a bit confusing but the gist is that `no_core` and `no_std` remove the
                 // sysroot dependence on `core` and `std` respectively. Our `CrateGraph` is eagerly
@@ -364,6 +323,7 @@ impl DefCollector<'_> {
                 if skip {
                     continue;
                 }
+
                 crate_data
                     .extern_prelude
                     .insert(name.clone(), (CrateRootModuleId { krate: dep.crate_id }, None));
@@ -410,17 +370,17 @@ impl DefCollector<'_> {
     }
 
     fn resolution_loop(&mut self) {
-        let _p = tracing::span!(tracing::Level::INFO, "DefCollector::resolution_loop").entered();
+        let _p = tracing::info_span!("DefCollector::resolution_loop").entered();
 
         // main name resolution fixed-point loop.
         let mut i = 0;
         'resolve_attr: loop {
-            let _p = tracing::span!(tracing::Level::INFO, "resolve_macros loop").entered();
+            let _p = tracing::info_span!("resolve_macros loop").entered();
             'resolve_macros: loop {
                 self.db.unwind_if_cancelled();
 
                 {
-                    let _p = tracing::span!(tracing::Level::INFO, "resolve_imports loop").entered();
+                    let _p = tracing::info_span!("resolve_imports loop").entered();
 
                     'resolve_imports: loop {
                         if self.resolve_imports() == ReachedFixedPoint::Yes {
@@ -446,19 +406,9 @@ impl DefCollector<'_> {
     }
 
     fn collect(&mut self) {
-        let _p = tracing::span!(tracing::Level::INFO, "DefCollector::collect").entered();
+        let _p = tracing::info_span!("DefCollector::collect").entered();
 
         self.resolution_loop();
-
-        // Resolve all indeterminate resolved imports again
-        // As some of the macros will expand newly import shadowing partial resolved imports
-        // FIXME: We maybe could skip this, if we handle the indeterminate imports in `resolve_imports`
-        // correctly
-        let partial_resolved = self.indeterminate_imports.drain(..).map(|directive| {
-            ImportDirective { status: PartialResolvedImport::Unresolved, ..directive }
-        });
-        self.unresolved_imports.extend(partial_resolved);
-        self.resolve_imports();
 
         let unresolved_imports = mem::take(&mut self.unresolved_imports);
         // show unresolved imports in completion, etc
@@ -544,27 +494,30 @@ impl DefCollector<'_> {
         }
 
         let krate = if self.def_map.data.no_std {
-            name![core]
-        } else if self.def_map.extern_prelude().any(|(name, _)| *name == name![std]) {
-            name![std]
+            Name::new_symbol_root(sym::core.clone())
+        } else if self.def_map.extern_prelude().any(|(name, _)| *name == sym::std.clone()) {
+            Name::new_symbol_root(sym::std.clone())
         } else {
             // If `std` does not exist for some reason, fall back to core. This mostly helps
             // keep r-a's own tests minimal.
-            name![core]
+            Name::new_symbol_root(sym::core.clone())
         };
 
         let edition = match self.def_map.data.edition {
-            Edition::Edition2015 => name![rust_2015],
-            Edition::Edition2018 => name![rust_2018],
-            Edition::Edition2021 => name![rust_2021],
-            Edition::Edition2024 => name![rust_2024],
+            Edition::Edition2015 => Name::new_symbol_root(sym::rust_2015.clone()),
+            Edition::Edition2018 => Name::new_symbol_root(sym::rust_2018.clone()),
+            Edition::Edition2021 => Name::new_symbol_root(sym::rust_2021.clone()),
+            Edition::Edition2024 => Name::new_symbol_root(sym::rust_2024.clone()),
         };
 
         let path_kind = match self.def_map.data.edition {
             Edition::Edition2015 => PathKind::Plain,
             _ => PathKind::Abs,
         };
-        let path = ModPath::from_segments(path_kind, [krate, name![prelude], edition]);
+        let path = ModPath::from_segments(
+            path_kind,
+            [krate, Name::new_symbol_root(sym::prelude.clone()), edition],
+        );
 
         let (per_ns, _) =
             self.def_map.resolve_path(self.db, DefMap::ROOT, &path, BuiltinShadowMode::Other, None);
@@ -580,7 +533,7 @@ impl DefCollector<'_> {
             types => {
                 tracing::debug!(
                     "could not resolve prelude path `{}` to module (resolved to {:?})",
-                    path.display(self.db.upcast()),
+                    path.display(self.db.upcast(), Edition::LATEST),
                     types
                 );
             }
@@ -610,11 +563,17 @@ impl DefCollector<'_> {
         fn_id: FunctionId,
     ) {
         let kind = def.kind.to_basedb_kind();
-        let (expander, kind) =
-            match self.proc_macros.as_ref().map(|it| it.iter().find(|(n, _)| n == &def.name)) {
-                Ok(Some(&(_, expander))) => (expander, kind),
-                _ => (CustomProcMacroExpander::dummy(), kind),
-            };
+        let (expander, kind) = match self.proc_macros.iter().find(|(n, _, _)| n == &def.name) {
+            Some(_)
+                if kind == hir_expand::proc_macro::ProcMacroKind::Attr
+                    && !self.db.expand_proc_attr_macros() =>
+            {
+                (CustomProcMacroExpander::disabled_proc_attr(), kind)
+            }
+            Some(&(_, _, true)) => (CustomProcMacroExpander::disabled(), kind),
+            Some(&(_, expander, false)) => (expander, kind),
+            None => (CustomProcMacroExpander::missing_expander(), kind),
+        };
 
         let proc_macro_id = ProcMacroLoc {
             container: self.def_map.crate_root(),
@@ -775,9 +734,9 @@ impl DefCollector<'_> {
             .filter_map(|mut directive| {
                 directive.status = self.resolve_import(directive.module_id, &directive.import);
                 match directive.status {
-                    PartialResolvedImport::Indeterminate(_) => {
+                    PartialResolvedImport::Indeterminate(resolved) => {
                         self.record_resolved_import(&directive);
-                        self.indeterminate_imports.push(directive);
+                        self.indeterminate_imports.push((directive, resolved));
                         res = ReachedFixedPoint::No;
                         None
                     }
@@ -790,73 +749,70 @@ impl DefCollector<'_> {
                 }
             })
             .collect();
+
+        // Resolve all indeterminate resolved imports again
+        // As some of the macros will expand newly import shadowing partial resolved imports
+        // FIXME: We maybe could skip this, if we handle the indeterminate imports in `resolve_imports`
+        // correctly
+        let mut indeterminate_imports = std::mem::take(&mut self.indeterminate_imports);
+        indeterminate_imports.retain_mut(|(directive, partially_resolved)| {
+            let partially_resolved = partially_resolved.availability();
+            directive.status = self.resolve_import(directive.module_id, &directive.import);
+            match directive.status {
+                PartialResolvedImport::Indeterminate(import)
+                    if partially_resolved != import.availability() =>
+                {
+                    self.record_resolved_import(directive);
+                    res = ReachedFixedPoint::No;
+                    false
+                }
+                PartialResolvedImport::Resolved(_) => {
+                    self.record_resolved_import(directive);
+                    res = ReachedFixedPoint::No;
+                    false
+                }
+                _ => true,
+            }
+        });
+        self.indeterminate_imports = indeterminate_imports;
+
         res
     }
 
     fn resolve_import(&self, module_id: LocalModuleId, import: &Import) -> PartialResolvedImport {
-        let _p = tracing::span!(tracing::Level::INFO, "resolve_import", import_path = %import.path.display(self.db.upcast()))
+        let _p = tracing::info_span!("resolve_import", import_path = %import.path.display(self.db.upcast(), Edition::LATEST))
             .entered();
         tracing::debug!("resolving import: {:?} ({:?})", import, self.def_map.data.edition);
-        match import.source {
-            ImportSource::ExternCrate { .. } => {
-                let name = import
-                    .path
-                    .as_ident()
-                    .expect("extern crate should have been desugared to one-element path");
+        let res = self.def_map.resolve_path_fp_with_macro(
+            self.db,
+            ResolveMode::Import,
+            module_id,
+            &import.path,
+            BuiltinShadowMode::Module,
+            None, // An import may resolve to any kind of macro.
+        );
 
-                let res = self.resolve_extern_crate(name);
-
-                match res {
-                    Some(res) => PartialResolvedImport::Resolved(PerNs::types(
-                        res.into(),
-                        Visibility::Public,
-                        None,
-                    )),
-                    None => PartialResolvedImport::Unresolved,
-                }
-            }
-            ImportSource::Use { .. } => {
-                let res = self.def_map.resolve_path_fp_with_macro(
-                    self.db,
-                    ResolveMode::Import,
-                    module_id,
-                    &import.path,
-                    BuiltinShadowMode::Module,
-                    None, // An import may resolve to any kind of macro.
-                );
-
-                let def = res.resolved_def;
-                if res.reached_fixedpoint == ReachedFixedPoint::No || def.is_none() {
-                    return PartialResolvedImport::Unresolved;
-                }
-
-                if res.from_differing_crate {
-                    return PartialResolvedImport::Resolved(
-                        def.filter_visibility(|v| matches!(v, Visibility::Public)),
-                    );
-                }
-
-                // Check whether all namespaces are resolved.
-                if def.is_full() {
-                    PartialResolvedImport::Resolved(def)
-                } else {
-                    PartialResolvedImport::Indeterminate(def)
-                }
-            }
+        let def = res.resolved_def;
+        if res.reached_fixedpoint == ReachedFixedPoint::No || def.is_none() {
+            return PartialResolvedImport::Unresolved;
         }
-    }
 
-    fn resolve_extern_crate(&self, name: &Name) -> Option<CrateRootModuleId> {
-        if *name == name![self] {
-            cov_mark::hit!(extern_crate_self_as);
-            Some(self.def_map.crate_root())
+        if res.from_differing_crate {
+            return PartialResolvedImport::Resolved(
+                def.filter_visibility(|v| matches!(v, Visibility::Public)),
+            );
+        }
+
+        // Check whether all namespaces are resolved.
+        if def.is_full() {
+            PartialResolvedImport::Resolved(def)
         } else {
-            self.deps.get(name).map(|dep| CrateRootModuleId { krate: dep.crate_id })
+            PartialResolvedImport::Indeterminate(def)
         }
     }
 
     fn record_resolved_import(&mut self, directive: &ImportDirective) {
-        let _p = tracing::span!(tracing::Level::INFO, "record_resolved_import").entered();
+        let _p = tracing::info_span!("record_resolved_import").entered();
 
         let module_id = directive.module_id;
         let import = &directive.import;
@@ -867,8 +823,12 @@ impl DefCollector<'_> {
             .unwrap_or(Visibility::Public);
 
         match import.source {
-            ImportSource::ExternCrate { .. }
-            | ImportSource::Use { kind: ImportKind::Plain | ImportKind::TypeOnly, .. } => {
+            ImportSource {
+                kind: kind @ (ImportKind::Plain | ImportKind::TypeOnly),
+                id,
+                use_tree,
+                ..
+            } => {
                 let name = match &import.alias {
                     Some(ImportAlias::Alias(name)) => Some(name),
                     Some(ImportAlias::Underscore) => None,
@@ -881,40 +841,20 @@ impl DefCollector<'_> {
                     },
                 };
 
-                let imp = match import.source {
-                    // extern crates in the crate root are special-cased to insert entries into the extern prelude: rust-lang/rust#54658
-                    ImportSource::ExternCrate { id, .. } => {
-                        if self.def_map.block.is_none() && module_id == DefMap::ROOT {
-                            if let (Some(ModuleDefId::ModuleId(def)), Some(name)) =
-                                (def.take_types(), name)
-                            {
-                                if let Ok(def) = def.try_into() {
-                                    Arc::get_mut(&mut self.def_map.data)
-                                        .unwrap()
-                                        .extern_prelude
-                                        .insert(name.clone(), (def, Some(id)));
-                                }
-                            }
-                        }
-                        ImportType::ExternCrate(id)
-                    }
-                    ImportSource::Use { kind, id, use_tree, .. } => {
-                        if kind == ImportKind::TypeOnly {
-                            def.values = None;
-                            def.macros = None;
-                        }
-                        ImportType::Import(ImportId { import: id, idx: use_tree })
-                    }
-                };
+                if kind == ImportKind::TypeOnly {
+                    def.values = None;
+                    def.macros = None;
+                }
+                let imp = ImportType::Import(ImportId { import: id, idx: use_tree });
                 tracing::debug!("resolved import {:?} ({:?}) to {:?}", name, import, def);
 
                 self.update(module_id, &[(name.cloned(), def)], vis, Some(imp));
             }
-            ImportSource::Use { kind: ImportKind::Glob, id, .. } => {
+            ImportSource { kind: ImportKind::Glob, id, is_prelude, .. } => {
                 tracing::debug!("glob import: {:?}", import);
                 match def.take_types() {
                     Some(ModuleDefId::ModuleId(m)) => {
-                        if let ImportSource::Use { id, is_prelude: true, .. } = import.source {
+                        if is_prelude {
                             // Note: This dodgily overrides the injected prelude. The rustc
                             // implementation seems to work the same though.
                             cov_mark::hit!(std_prelude);
@@ -1027,7 +967,7 @@ impl DefCollector<'_> {
 
     fn update_recursive(
         &mut self,
-        // The module for which `resolutions` have been resolve
+        // The module for which `resolutions` have been resolved.
         module_id: LocalModuleId,
         resolutions: &[(Option<Name>, PerNs)],
         // All resolutions are imported with this visibility; the visibilities in
@@ -1045,10 +985,9 @@ impl DefCollector<'_> {
         for (name, res) in resolutions {
             match name {
                 Some(name) => {
-                    let scope = &mut self.def_map.modules[module_id].scope;
-                    changed |= scope.push_res_with_import(
-                        &mut self.from_glob_import,
-                        (module_id, name.clone()),
+                    changed |= self.push_res_and_update_glob_vis(
+                        module_id,
+                        name,
                         res.with_visibility(vis),
                         import,
                     );
@@ -1114,6 +1053,84 @@ impl DefCollector<'_> {
         }
     }
 
+    fn push_res_and_update_glob_vis(
+        &mut self,
+        module_id: LocalModuleId,
+        name: &Name,
+        mut defs: PerNs,
+        def_import_type: Option<ImportType>,
+    ) -> bool {
+        let mut changed = false;
+
+        if let Some(ImportType::Glob(_)) = def_import_type {
+            let prev_defs = self.def_map[module_id].scope.get(name);
+
+            // Multiple globs may import the same item and they may override visibility from
+            // previously resolved globs. Handle overrides here and leave the rest to
+            // `ItemScope::push_res_with_import()`.
+            if let Some((def, def_vis, _)) = defs.types {
+                if let Some((prev_def, prev_vis, _)) = prev_defs.types {
+                    if def == prev_def
+                        && self.from_glob_import.contains_type(module_id, name.clone())
+                        && def_vis != prev_vis
+                        && def_vis.max(prev_vis, &self.def_map) == Some(def_vis)
+                    {
+                        changed = true;
+                        // This import is being handled here, don't pass it down to
+                        // `ItemScope::push_res_with_import()`.
+                        defs.types = None;
+                        self.def_map.modules[module_id]
+                            .scope
+                            .update_visibility_types(name, def_vis);
+                    }
+                }
+            }
+
+            if let Some((def, def_vis, _)) = defs.values {
+                if let Some((prev_def, prev_vis, _)) = prev_defs.values {
+                    if def == prev_def
+                        && self.from_glob_import.contains_value(module_id, name.clone())
+                        && def_vis != prev_vis
+                        && def_vis.max(prev_vis, &self.def_map) == Some(def_vis)
+                    {
+                        changed = true;
+                        // See comment above.
+                        defs.values = None;
+                        self.def_map.modules[module_id]
+                            .scope
+                            .update_visibility_values(name, def_vis);
+                    }
+                }
+            }
+
+            if let Some((def, def_vis, _)) = defs.macros {
+                if let Some((prev_def, prev_vis, _)) = prev_defs.macros {
+                    if def == prev_def
+                        && self.from_glob_import.contains_macro(module_id, name.clone())
+                        && def_vis != prev_vis
+                        && def_vis.max(prev_vis, &self.def_map) == Some(def_vis)
+                    {
+                        changed = true;
+                        // See comment above.
+                        defs.macros = None;
+                        self.def_map.modules[module_id]
+                            .scope
+                            .update_visibility_macros(name, def_vis);
+                    }
+                }
+            }
+        }
+
+        changed |= self.def_map.modules[module_id].scope.push_res_with_import(
+            &mut self.from_glob_import,
+            (module_id, name.clone()),
+            defs,
+            def_import_type,
+        );
+
+        changed
+    }
+
     fn resolve_macros(&mut self) -> ReachedFixedPoint {
         let mut macros = mem::take(&mut self.unresolved_macros);
         let mut resolved = Vec::new();
@@ -1136,18 +1153,18 @@ impl DefCollector<'_> {
                     MacroSubNs::Attr
                 }
             };
-            let resolver = |path| {
+            let resolver = |path: &_| {
                 let resolved_res = self.def_map.resolve_path_fp_with_macro(
                     self.db,
                     ResolveMode::Other,
                     directive.module_id,
-                    &path,
+                    path,
                     BuiltinShadowMode::Module,
                     Some(subns),
                 );
                 resolved_res.resolved_def.take_macros().map(|it| (it, self.db.macro_def(it)))
             };
-            let resolver_def_id = |path| resolver(path).map(|(_, it)| it);
+            let resolver_def_id = |path: &_| resolver(path).map(|(_, it)| it);
 
             match &directive.kind {
                 MacroDirectiveKind::FnLike { ast_id, expand_to, ctxt: call_site } => {
@@ -1250,22 +1267,36 @@ impl DefCollector<'_> {
                         }
                     }
 
-                    let def = match resolver_def_id(path.clone()) {
+                    let def = match resolver_def_id(path) {
                         Some(def) if def.is_attribute() => def,
                         _ => return Resolved::No,
                     };
 
-                    let call_id =
-                        attr_macro_as_call_id(self.db, file_ast_id, attr, self.def_map.krate, def);
-                    if let MacroDefId {
-                        kind:
-                            MacroDefKind::BuiltInAttr(
-                                BuiltinAttrExpander::Derive | BuiltinAttrExpander::DeriveConst,
-                                _,
-                            ),
-                        ..
-                    } = def
-                    {
+                    // Skip #[test]/#[bench]/#[test_case] expansion, which would merely result in more memory usage
+                    // due to duplicating functions into macro expansions, but only if `cfg(test)` is active,
+                    // otherwise they are expanded to nothing and this can impact e.g. diagnostics (due to things
+                    // being cfg'ed out).
+                    // Ideally we will just expand them to nothing here. But we are only collecting macro calls,
+                    // not expanding them, so we have no way to do that.
+                    if matches!(
+                        def.kind,
+                        MacroDefKind::BuiltInAttr(_, expander)
+                        if expander.is_test() || expander.is_bench() || expander.is_test_case()
+                    ) {
+                        let test_is_active =
+                            self.cfg_options.check_atom(&CfgAtom::Flag(sym::test.clone()));
+                        if test_is_active {
+                            return recollect_without(self);
+                        }
+                    }
+
+                    let call_id = || {
+                        attr_macro_as_call_id(self.db, file_ast_id, attr, self.def_map.krate, def)
+                    };
+                    if matches!(def,
+                        MacroDefId { kind: MacroDefKind::BuiltInAttr(_, exp), .. }
+                        if exp.is_derive()
+                    ) {
                         // Resolved to `#[derive]`, we don't actually expand this attribute like
                         // normal (as that would just be an identity expansion with extra output)
                         // Instead we treat derive attributes special and apply them separately.
@@ -1290,9 +1321,14 @@ impl DefCollector<'_> {
 
                         match attr.parse_path_comma_token_tree(self.db.upcast()) {
                             Some(derive_macros) => {
+                                let call_id = call_id();
                                 let mut len = 0;
                                 for (idx, (path, call_site)) in derive_macros.enumerate() {
-                                    let ast_id = AstIdWithPath::new(file_id, ast_id.value, path);
+                                    let ast_id = AstIdWithPath::new(
+                                        file_id,
+                                        ast_id.value,
+                                        Interned::new(path),
+                                    );
                                     self.unresolved_macros.push(MacroDirective {
                                         module_id: directive.module_id,
                                         depth: directive.depth + 1,
@@ -1312,13 +1348,6 @@ impl DefCollector<'_> {
                                 // This is just a trick to be able to resolve the input to derives
                                 // as proper paths in `Semantics`.
                                 // Check the comment in [`builtin_attr_macro`].
-                                let call_id = attr_macro_as_call_id(
-                                    self.db,
-                                    file_ast_id,
-                                    attr,
-                                    self.def_map.krate,
-                                    def,
-                                );
                                 self.def_map.modules[directive.module_id]
                                     .scope
                                     .init_derive_attribute(ast_id, attr.id, call_id, len + 1);
@@ -1336,44 +1365,23 @@ impl DefCollector<'_> {
                         return recollect_without(self);
                     }
 
-                    // Skip #[test]/#[bench] expansion, which would merely result in more memory usage
-                    // due to duplicating functions into macro expansions
-                    if matches!(
-                        def.kind,
-                        MacroDefKind::BuiltInAttr(expander, _)
-                        if expander.is_test() || expander.is_bench()
-                    ) {
-                        return recollect_without(self);
-                    }
-
-                    if let MacroDefKind::ProcMacro(exp, ..) = def.kind {
-                        // If proc attribute macro expansion is disabled, skip expanding it here
-                        if !self.db.expand_proc_attr_macros() {
-                            self.def_map.diagnostics.push(DefDiagnostic::unresolved_proc_macro(
-                                directive.module_id,
-                                self.db.lookup_intern_macro_call(call_id).kind,
-                                def.krate,
-                            ));
-                            return recollect_without(self);
-                        }
-
+                    if let MacroDefKind::ProcMacro(_, exp, _) = def.kind {
                         // If there's no expander for the proc macro (e.g.
                         // because proc macros are disabled, or building the
                         // proc macro crate failed), report this and skip
                         // expansion like we would if it was disabled
-                        if exp.is_dummy() {
-                            self.def_map.diagnostics.push(DefDiagnostic::unresolved_proc_macro(
+                        if let Some(err) = exp.as_expand_error(def.krate) {
+                            self.def_map.diagnostics.push(DefDiagnostic::macro_error(
                                 directive.module_id,
-                                self.db.lookup_intern_macro_call(call_id).kind,
-                                def.krate,
+                                ast_id,
+                                (**path).clone(),
+                                err,
                             ));
-                            return recollect_without(self);
-                        }
-                        if exp.is_disabled() {
                             return recollect_without(self);
                         }
                     }
 
+                    let call_id = call_id();
                     self.def_map.modules[directive.module_id]
                         .scope
                         .add_attr_macro_invoc(ast_id, call_id);
@@ -1405,17 +1413,28 @@ impl DefCollector<'_> {
         depth: usize,
         container: ItemContainerId,
     ) {
-        if EXPANSION_DEPTH_LIMIT.check(depth).is_err() {
+        let recursion_limit = self.def_map.recursion_limit() as usize;
+        let recursion_limit = Limit::new(if cfg!(test) {
+            // Without this, `body::tests::your_stack_belongs_to_me` stack-overflows in debug
+            std::cmp::min(32, recursion_limit)
+        } else {
+            recursion_limit
+        });
+        if recursion_limit.check(depth).is_err() {
             cov_mark::hit!(macro_expansion_overflow);
             tracing::warn!("macro expansion is too deep");
             return;
         }
         let file_id = macro_call_id.as_file();
 
-        // Then, fetch and process the item tree. This will reuse the expansion result from above.
         let item_tree = self.db.file_item_tree(file_id);
 
-        let mod_dir = self.mod_dirs[&module_id].clone();
+        let mod_dir = if macro_call_id.as_macro_file().is_include_macro(self.db.upcast()) {
+            ModDir::root()
+        } else {
+            self.mod_dirs[&module_id].clone()
+        };
+
         ModCollector {
             def_collector: &mut *self,
             macro_depth: depth,
@@ -1430,7 +1449,7 @@ impl DefCollector<'_> {
     fn finish(mut self) -> DefMap {
         // Emit diagnostics for all remaining unexpanded macros.
 
-        let _p = tracing::span!(tracing::Level::INFO, "DefCollector::finish").entered();
+        let _p = tracing::info_span!("DefCollector::finish").entered();
 
         for directive in &self.unresolved_macros {
             match &directive.kind {
@@ -1447,7 +1466,7 @@ impl DefCollector<'_> {
                                 self.db,
                                 ResolveMode::Other,
                                 directive.module_id,
-                                &path,
+                                path,
                                 BuiltinShadowMode::Module,
                                 Some(MacroSubNs::Bang),
                             );
@@ -1481,7 +1500,7 @@ impl DefCollector<'_> {
                             derive_index: *derive_pos as u32,
                             derive_macro_id: *derive_macro_id,
                         },
-                        ast_id.path.clone(),
+                        ast_id.path.as_ref().clone(),
                     ));
                 }
                 // These are diagnosed by `reseed_with_unresolved_attribute`, as that function consumes them
@@ -1490,45 +1509,29 @@ impl DefCollector<'_> {
         }
 
         // Emit diagnostics for all remaining unresolved imports.
-
-        // We'd like to avoid emitting a diagnostics avalanche when some `extern crate` doesn't
-        // resolve. We first emit diagnostics for unresolved extern crates and collect the missing
-        // crate names. Then we emit diagnostics for unresolved imports, but only if the import
-        // doesn't start with an unresolved crate's name. Due to renaming and reexports, this is a
-        // heuristic, but it works in practice.
-        let mut diagnosed_extern_crates = FxHashSet::default();
-        for directive in &self.unresolved_imports {
-            if let ImportSource::ExternCrate { id } = directive.import.source {
-                let item_tree_id = id.lookup(self.db).id;
-                let item_tree = item_tree_id.item_tree(self.db);
-                let extern_crate = &item_tree[item_tree_id.value];
-
-                diagnosed_extern_crates.insert(extern_crate.name.clone());
-
-                self.def_map.diagnostics.push(DefDiagnostic::unresolved_extern_crate(
-                    directive.module_id,
-                    InFile::new(item_tree_id.file_id(), extern_crate.ast_id),
-                ));
+        for import in &self.unresolved_imports {
+            let &ImportDirective {
+                module_id,
+                import:
+                    Import {
+                        ref path,
+                        source: ImportSource { use_tree, id, is_prelude: _, kind: _ },
+                        ..
+                    },
+                ..
+            } = import;
+            if matches!(
+                (path.segments().first(), &path.kind),
+                (Some(krate), PathKind::Plain | PathKind::Abs) if self.unresolved_extern_crates.contains(krate)
+            ) {
+                continue;
             }
-        }
-
-        for directive in &self.unresolved_imports {
-            if let ImportSource::Use { use_tree, id, is_prelude: _, kind: _ } =
-                directive.import.source
-            {
-                if matches!(
-                    (directive.import.path.segments().first(), &directive.import.path.kind),
-                    (Some(krate), PathKind::Plain | PathKind::Abs) if diagnosed_extern_crates.contains(krate)
-                ) {
-                    continue;
-                }
-                let item_tree_id = id.lookup(self.db).id;
-                self.def_map.diagnostics.push(DefDiagnostic::unresolved_import(
-                    directive.module_id,
-                    item_tree_id,
-                    use_tree,
-                ));
-            }
+            let item_tree_id = id.lookup(self.db).id;
+            self.def_map.diagnostics.push(DefDiagnostic::unresolved_import(
+                module_id,
+                item_tree_id,
+                use_tree,
+            ));
         }
 
         self.def_map
@@ -1553,7 +1556,8 @@ impl ModCollector<'_, '_> {
 
     fn collect(&mut self, items: &[ModItem], container: ItemContainerId) {
         let krate = self.def_collector.def_map.krate;
-        let is_crate_root = self.module_id == DefMap::ROOT;
+        let is_crate_root =
+            self.module_id == DefMap::ROOT && self.def_collector.def_map.block.is_none();
 
         // Note: don't assert that inserted value is fresh: it's simply not true
         // for macros.
@@ -1561,6 +1565,7 @@ impl ModCollector<'_, '_> {
 
         // Prelude module is always considered to be `#[macro_use]`.
         if let Some((prelude_module, _use)) = self.def_collector.def_map.prelude {
+            // Don't insert macros from the prelude into blocks, as they can be shadowed by other macros.
             if prelude_module.krate != krate && is_crate_root {
                 cov_mark::hit!(prelude_is_macro_use);
                 self.def_collector.import_macros_from_extern_crate(
@@ -1592,10 +1597,7 @@ impl ModCollector<'_, '_> {
             let attrs = self.item_tree.attrs(db, krate, item.into());
             if let Some(cfg) = attrs.cfg() {
                 if !self.is_cfg_enabled(&cfg) {
-                    self.emit_unconfigured_diagnostic(
-                        InFile::new(self.file_id(), item.ast_id(self.item_tree).erase()),
-                        &cfg,
-                    );
+                    self.emit_unconfigured_diagnostic(self.tree_id, item.into(), &cfg);
                     return;
                 }
             }
@@ -1617,7 +1619,7 @@ impl ModCollector<'_, '_> {
                         id: ItemTreeId::new(self.tree_id, item_tree_id),
                     }
                     .intern(db);
-                    let is_prelude = attrs.by_key("prelude_import").exists();
+                    let is_prelude = attrs.by_key(&sym::prelude_import).exists();
                     Import::from_use(
                         self.item_tree,
                         ItemTreeId::new(self.tree_id, item_tree_id),
@@ -1638,26 +1640,73 @@ impl ModCollector<'_, '_> {
                         id: ItemTreeId::new(self.tree_id, item_tree_id),
                     }
                     .intern(db);
-                    if is_crate_root {
-                        self.process_macro_use_extern_crate(
-                            item_tree_id,
-                            id,
-                            attrs.by_key("macro_use").attrs(),
+                    def_map.modules[self.module_id].scope.define_extern_crate_decl(id);
+
+                    let item_tree::ExternCrate { name, visibility, alias, ast_id } =
+                        &self.item_tree[item_tree_id];
+
+                    let is_self = *name == sym::self_;
+                    let resolved = if is_self {
+                        cov_mark::hit!(extern_crate_self_as);
+                        Some(def_map.crate_root())
+                    } else {
+                        self.def_collector
+                            .deps
+                            .get(name)
+                            .map(|dep| CrateRootModuleId { krate: dep.crate_id })
+                    };
+
+                    let name = match alias {
+                        Some(ImportAlias::Alias(name)) => Some(name),
+                        Some(ImportAlias::Underscore) => None,
+                        None => Some(name),
+                    };
+
+                    if let Some(resolved) = resolved {
+                        let vis = resolve_vis(def_map, &self.item_tree[*visibility]);
+
+                        if is_crate_root {
+                            // extern crates in the crate root are special-cased to insert entries into the extern prelude: rust-lang/rust#54658
+                            if let Some(name) = name {
+                                Arc::get_mut(&mut def_map.data)
+                                    .unwrap()
+                                    .extern_prelude
+                                    .insert(name.clone(), (resolved, Some(id)));
+                            }
+                            // they also allow `#[macro_use]`
+                            if !is_self {
+                                self.process_macro_use_extern_crate(
+                                    id,
+                                    attrs.by_key(&sym::macro_use).attrs(),
+                                    resolved.krate,
+                                );
+                            }
+                        }
+
+                        self.def_collector.update(
+                            module_id,
+                            &[(
+                                name.cloned(),
+                                PerNs::types(
+                                    resolved.into(),
+                                    vis,
+                                    Some(ImportOrExternCrate::ExternCrate(id)),
+                                ),
+                            )],
+                            vis,
+                            Some(ImportType::ExternCrate(id)),
+                        );
+                    } else {
+                        if let Some(name) = name {
+                            self.def_collector.unresolved_extern_crates.insert(name.clone());
+                        }
+                        self.def_collector.def_map.diagnostics.push(
+                            DefDiagnostic::unresolved_extern_crate(
+                                module_id,
+                                InFile::new(self.file_id(), *ast_id),
+                            ),
                         );
                     }
-
-                    self.def_collector.def_map.modules[self.module_id]
-                        .scope
-                        .define_extern_crate_decl(id);
-                    self.def_collector.unresolved_imports.push(ImportDirective {
-                        module_id: self.module_id,
-                        import: Import::from_extern_crate(
-                            self.item_tree,
-                            ItemTreeId::new(self.tree_id, item_tree_id),
-                            id,
-                        ),
-                        status: PartialResolvedImport::Unresolved,
-                    })
                 }
                 ModItem::ExternBlock(block) => self.collect(
                     &self.item_tree[block].children,
@@ -1711,7 +1760,7 @@ impl ModCollector<'_, '_> {
                             .into(),
                         &it.name,
                         vis,
-                        !matches!(it.fields, Fields::Record(_)),
+                        !matches!(it.shape, FieldsShape::Record),
                     );
                 }
                 ModItem::Union(id) => {
@@ -1749,10 +1798,8 @@ impl ModCollector<'_, '_> {
                             match is_enabled {
                                 Err(cfg) => {
                                     self.emit_unconfigured_diagnostic(
-                                        InFile::new(
-                                            self.file_id(),
-                                            self.item_tree[variant.index()].ast_id.erase(),
-                                        ),
+                                        self.tree_id,
+                                        variant.into(),
                                         &cfg,
                                     );
                                     None
@@ -1870,27 +1917,15 @@ impl ModCollector<'_, '_> {
 
     fn process_macro_use_extern_crate<'a>(
         &mut self,
-        extern_crate: FileItemTreeId<ExternCrate>,
         extern_crate_id: ExternCrateId,
         macro_use_attrs: impl Iterator<Item = &'a Attr>,
+        target_crate: CrateId,
     ) {
-        let db = self.def_collector.db;
-
-        let target_crate =
-            match self.def_collector.resolve_extern_crate(&self.item_tree[extern_crate].name) {
-                Some(m) if m.krate == self.def_collector.def_map.krate => {
-                    cov_mark::hit!(ignore_macro_use_extern_crate_self);
-                    return;
-                }
-                Some(m) => m.krate,
-                None => return,
-            };
-
         cov_mark::hit!(macro_rules_from_other_crates_are_visible_with_macro_use);
-
         let mut single_imports = Vec::new();
         for attr in macro_use_attrs {
-            let Some(paths) = attr.parse_path_comma_token_tree(db.upcast()) else {
+            let Some(paths) = attr.parse_path_comma_token_tree(self.def_collector.db.upcast())
+            else {
                 // `#[macro_use]` (without any paths) found, forget collected names and just import
                 // all visible macros.
                 self.def_collector.import_macros_from_extern_crate(
@@ -1915,8 +1950,8 @@ impl ModCollector<'_, '_> {
     }
 
     fn collect_module(&mut self, module_id: FileItemTreeId<Mod>, attrs: &Attrs) {
-        let path_attr = attrs.by_key("path").string_value_unescape();
-        let is_macro_use = attrs.by_key("macro_use").exists();
+        let path_attr = attrs.by_key(&sym::path).string_value_unescape();
+        let is_macro_use = attrs.by_key(&sym::macro_use).exists();
         let module = &self.item_tree[module_id];
         match &module.kind {
             // inline module, just recurse
@@ -1968,7 +2003,8 @@ impl ModCollector<'_, '_> {
                         match is_enabled {
                             Err(cfg) => {
                                 self.emit_unconfigured_diagnostic(
-                                    ast_id.map(|it| it.erase()),
+                                    self.tree_id,
+                                    AttrOwner::ModItem(module_id.into()),
                                     &cfg,
                                 );
                             }
@@ -1992,7 +2028,7 @@ impl ModCollector<'_, '_> {
                                 let is_macro_use = is_macro_use
                                     || item_tree
                                         .top_level_attrs(db, krate)
-                                        .by_key("macro_use")
+                                        .by_key(&sym::macro_use)
                                         .exists();
                                 if is_macro_use {
                                     self.import_all_legacy_macros(module_id);
@@ -2021,7 +2057,7 @@ impl ModCollector<'_, '_> {
         &mut self,
         name: Name,
         declaration: FileAstId<ast::Module>,
-        definition: Option<(FileId, bool)>,
+        definition: Option<(EditionedFileId, bool)>,
         visibility: &crate::visibility::RawVisibility,
         mod_tree_id: FileItemTreeId<Mod>,
     ) -> LocalModuleId {
@@ -2110,13 +2146,13 @@ impl ModCollector<'_, '_> {
             }
             tracing::debug!(
                 "non-builtin attribute {}",
-                attr.path.display(self.def_collector.db.upcast())
+                attr.path.display(self.def_collector.db.upcast(), Edition::LATEST)
             );
 
             let ast_id = AstIdWithPath::new(
                 self.file_id(),
                 mod_item.ast_id(self.item_tree),
-                attr.path.as_ref().clone(),
+                attr.path.clone(),
             );
             self.def_collector.unresolved_macros.push(MacroDirective {
                 module_id: self.module_id,
@@ -2142,14 +2178,12 @@ impl ModCollector<'_, '_> {
         let attrs = self.item_tree.attrs(self.def_collector.db, krate, ModItem::from(id).into());
         let ast_id = InFile::new(self.file_id(), mac.ast_id.upcast());
 
-        let export_attr = attrs.by_key("macro_export");
+        let export_attr = attrs.by_key(&sym::macro_export);
 
         let is_export = export_attr.exists();
         let local_inner = if is_export {
             export_attr.tt_values().flat_map(|it| it.token_trees.iter()).any(|it| match it {
-                tt::TokenTree::Leaf(tt::Leaf::Ident(ident)) => {
-                    ident.text.contains("local_inner_macros")
-                }
+                tt::TokenTree::Leaf(tt::Leaf::Ident(ident)) => ident.sym == sym::local_inner_macros,
                 _ => false,
             })
         } else {
@@ -2157,29 +2191,17 @@ impl ModCollector<'_, '_> {
         };
 
         // Case 1: builtin macros
-        let expander = if attrs.by_key("rustc_builtin_macro").exists() {
+        let expander = if attrs.by_key(&sym::rustc_builtin_macro).exists() {
             // `#[rustc_builtin_macro = "builtin_name"]` overrides the `macro_rules!` name.
             let name;
-            let name = match attrs.by_key("rustc_builtin_macro").string_value() {
-                Some(it) => {
-                    // FIXME: a hacky way to create a Name from string.
-                    name = tt::Ident {
-                        text: it.into(),
-                        span: Span {
-                            range: syntax::TextRange::empty(syntax::TextSize::new(0)),
-                            anchor: span::SpanAnchor {
-                                file_id: FileId::BOGUS,
-                                ast_id: span::ROOT_ERASED_FILE_AST_ID,
-                            },
-                            ctx: SyntaxContextId::ROOT,
-                        },
-                    }
-                    .as_name();
+            let name = match attrs.by_key(&sym::rustc_builtin_macro).string_value_with_span() {
+                Some((it, span)) => {
+                    name = Name::new_symbol(it.clone(), span.ctx);
                     &name
                 }
                 None => {
                     let explicit_name =
-                        attrs.by_key("rustc_builtin_macro").tt_values().next().and_then(|tt| {
+                        attrs.by_key(&sym::rustc_builtin_macro).tt_values().next().and_then(|tt| {
                             match tt.token_trees.first() {
                                 Some(tt::TokenTree::Leaf(tt::Leaf::Ident(name))) => Some(name),
                                 _ => None,
@@ -2209,7 +2231,7 @@ impl ModCollector<'_, '_> {
             // Case 2: normal `macro_rules!` macro
             MacroExpander::Declarative
         };
-        let allow_internal_unsafe = attrs.by_key("allow_internal_unsafe").exists();
+        let allow_internal_unsafe = attrs.by_key(&sym::allow_internal_unsafe).exists();
 
         let mut flags = MacroRulesLocFlags::empty();
         flags.set(MacroRulesLocFlags::LOCAL_INNER, local_inner);
@@ -2239,14 +2261,14 @@ impl ModCollector<'_, '_> {
         // Case 1: builtin macros
         let mut helpers_opt = None;
         let attrs = self.item_tree.attrs(self.def_collector.db, krate, ModItem::from(id).into());
-        let expander = if attrs.by_key("rustc_builtin_macro").exists() {
+        let expander = if attrs.by_key(&sym::rustc_builtin_macro).exists() {
             if let Some(expander) = find_builtin_macro(&mac.name) {
                 match expander {
                     Either::Left(it) => MacroExpander::BuiltIn(it),
                     Either::Right(it) => MacroExpander::BuiltInEager(it),
                 }
             } else if let Some(expander) = find_builtin_derive(&mac.name) {
-                if let Some(attr) = attrs.by_key("rustc_builtin_macro").tt_values().next() {
+                if let Some(attr) = attrs.by_key(&sym::rustc_builtin_macro).tt_values().next() {
                     // NOTE: The item *may* have both `#[rustc_builtin_macro]` and `#[proc_macro_derive]`,
                     // in which case rustc ignores the helper attributes from the latter, but it
                     // "doesn't make sense in practice" (see rust-lang/rust#87027).
@@ -2259,8 +2281,8 @@ impl ModCollector<'_, '_> {
                         stdx::always!(
                             name == mac.name,
                             "built-in macro {} has #[rustc_builtin_macro] which declares different name {}",
-                            mac.name.display(self.def_collector.db.upcast()),
-                            name.display(self.def_collector.db.upcast())
+                            mac.name.display(self.def_collector.db.upcast(), Edition::LATEST),
+                            name.display(self.def_collector.db.upcast(), Edition::LATEST),
                         );
                         helpers_opt = Some(helpers);
                     }
@@ -2279,7 +2301,7 @@ impl ModCollector<'_, '_> {
             // Case 2: normal `macro`
             MacroExpander::Declarative
         };
-        let allow_internal_unsafe = attrs.by_key("allow_internal_unsafe").exists();
+        let allow_internal_unsafe = attrs.by_key(&sym::allow_internal_unsafe).exists();
 
         let macro_id = Macro2Loc {
             container: module,
@@ -2310,7 +2332,7 @@ impl ModCollector<'_, '_> {
         &MacroCall { ref path, ast_id, expand_to, ctxt }: &MacroCall,
         container: ItemContainerId,
     ) {
-        let ast_id = AstIdWithPath::new(self.file_id(), ast_id, ModPath::clone(path));
+        let ast_id = AstIdWithPath::new(self.file_id(), ast_id, path.clone());
         let db = self.def_collector.db;
 
         // FIXME: Immediately expanding in "Case 1" is insufficient since "Case 2" may also define
@@ -2320,7 +2342,8 @@ impl ModCollector<'_, '_> {
         // Case 1: try to resolve macro calls with single-segment name and expand macro_rules
         if let Ok(res) = macro_call_as_call_id_with_eager(
             db.upcast(),
-            &ast_id,
+            ast_id.ast_id,
+            &ast_id.path,
             ctxt,
             expand_to,
             self.def_collector.def_map.krate,
@@ -2347,7 +2370,7 @@ impl ModCollector<'_, '_> {
                     db,
                     ResolveMode::Other,
                     self.module_id,
-                    &path,
+                    path,
                     BuiltinShadowMode::Module,
                     Some(MacroSubNs::Bang),
                 );
@@ -2427,10 +2450,11 @@ impl ModCollector<'_, '_> {
         self.def_collector.cfg_options.check(cfg) != Some(false)
     }
 
-    fn emit_unconfigured_diagnostic(&mut self, ast_id: InFile<ErasedFileAstId>, cfg: &CfgExpr) {
+    fn emit_unconfigured_diagnostic(&mut self, tree_id: TreeId, item: AttrOwner, cfg: &CfgExpr) {
         self.def_collector.def_map.diagnostics.push(DefDiagnostic::unconfigured_code(
             self.module_id,
-            ast_id,
+            tree_id,
+            item,
             cfg.clone(),
             self.def_collector.cfg_options.clone(),
         ));
@@ -2461,10 +2485,11 @@ mod tests {
             unresolved_macros: Vec::new(),
             mod_dirs: FxHashMap::default(),
             cfg_options: &CfgOptions::default(),
-            proc_macros: Ok(vec![]),
+            proc_macros: Default::default(),
             from_glob_import: Default::default(),
             skip_attrs: Default::default(),
             is_proc_macro: false,
+            unresolved_extern_crates: Default::default(),
         };
         collector.seed_with_top_level();
         collector.collect();

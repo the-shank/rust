@@ -1,4 +1,4 @@
-//! Sanity checking performed by rustbuild before actually executing anything.
+//! Sanity checking performed by bootstrap before actually executing anything.
 //!
 //! This module contains the implementation of ensuring that the build
 //! environment looks reasonable before progressing. This will verify that
@@ -8,24 +8,19 @@
 //! In theory if we get past this phase it's a bug if a build fails, but in
 //! practice that's likely not true!
 
-use std::collections::HashMap;
-use std::env;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::{env, fs};
 
+use crate::Build;
 #[cfg(not(feature = "bootstrap-self-test"))]
 use crate::builder::Builder;
+use crate::builder::Kind;
 #[cfg(not(feature = "bootstrap-self-test"))]
 use crate::core::build_steps::tool;
-#[cfg(not(feature = "bootstrap-self-test"))]
-use std::collections::HashSet;
-
-use crate::builder::Kind;
 use crate::core::config::Target;
-use crate::utils::helpers::output;
-use crate::Build;
+use crate::utils::exec::command;
 
 pub struct Finder {
     cache: HashMap<OsString, Option<PathBuf>>,
@@ -37,7 +32,6 @@ pub struct Finder {
 // it might not yet be included in stage0. In such cases, we handle the targets missing from stage0 in this list.
 //
 // Targets can be removed from this list once they are present in the stage0 compiler (usually by updating the beta compiler of the bootstrap).
-#[cfg(not(feature = "bootstrap-self-test"))]
 const STAGE0_MISSING_TARGETS: &[&str] = &[
     // just a dummy comment so the list doesn't get onelined
 ];
@@ -128,6 +122,9 @@ pub fn check(build: &mut Build) {
                     eprintln!(
                         "Consider upgrading libstdc++ or disabling the `llvm.download-ci-llvm` option."
                     );
+                    eprintln!(
+                        "If you choose to upgrade libstdc++, run `x clean` or delete `build/host/libcxx-version` manually after the upgrade."
+                    );
                 }
             }
             tool::LibcxxVersion::Llvm(_) => {
@@ -137,19 +134,20 @@ pub fn check(build: &mut Build) {
     }
 
     // We need cmake, but only if we're actually building LLVM or sanitizers.
-    let building_llvm = build
-        .hosts
-        .iter()
-        .map(|host| {
-            build.config.llvm_enabled(*host)
-                && build
-                    .config
-                    .target_config
-                    .get(host)
-                    .map(|config| config.llvm_config.is_none())
-                    .unwrap_or(true)
-        })
-        .any(|build_llvm_ourselves| build_llvm_ourselves);
+    let building_llvm = !build.config.llvm_from_ci
+        && build
+            .hosts
+            .iter()
+            .map(|host| {
+                build.config.llvm_enabled(*host)
+                    && build
+                        .config
+                        .target_config
+                        .get(host)
+                        .map(|config| config.llvm_config.is_none())
+                        .unwrap_or(true)
+            })
+            .any(|build_llvm_ourselves| build_llvm_ourselves);
 
     let need_cmake = building_llvm || build.config.any_sanitizers_to_build();
     if need_cmake && cmd_finder.maybe_have("cmake").is_none() {
@@ -204,12 +202,12 @@ than building it.
         .map(|p| cmd_finder.must_have(p))
         .or_else(|| cmd_finder.maybe_have("reuse"));
 
-    #[cfg(not(feature = "bootstrap-self-test"))]
-    let stage0_supported_target_list: HashSet<String> =
-        output(Command::new(&build.config.initial_rustc).args(["--print", "target-list"]))
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
+    let stage0_supported_target_list: HashSet<String> = crate::utils::helpers::output(
+        command(&build.config.initial_rustc).args(["--print", "target-list"]).as_command_mut(),
+    )
+    .lines()
+    .map(|s| s.to_string())
+    .collect();
 
     // We're gonna build some custom C code here and there, host triples
     // also build some C++ shims for LLVM so we need a C++ compiler.
@@ -232,7 +230,7 @@ than building it.
         }
 
         // Ignore fake targets that are only used for unit tests in bootstrap.
-        #[cfg(not(feature = "bootstrap-self-test"))]
+        if cfg!(not(feature = "bootstrap-self-test")) && !skip_target_sanity && !build.local_rebuild
         {
             let mut has_target = false;
             let target_str = target.to_string();
@@ -258,7 +256,9 @@ than building it.
 
             if !has_target {
                 // This might also be a custom target, so check the target file that could have been specified by the user.
-                if let Some(custom_target_path) = env::var_os("RUST_TARGET_PATH") {
+                if target.filepath().is_some_and(|p| p.exists()) {
+                    has_target = true;
+                } else if let Some(custom_target_path) = env::var_os("RUST_TARGET_PATH") {
                     let mut target_filename = OsString::from(&target_str);
                     // Target filename ends with `.json`.
                     target_filename.push(".json");
@@ -273,8 +273,12 @@ than building it.
 
             if !has_target {
                 panic!(
-                    "No such target exists in the target list,
-                specify a correct location of the JSON specification file for custom targets!"
+                    "No such target exists in the target list,\n\
+                     make sure to correctly specify the location \
+                     of the JSON specification file \
+                     for custom targets!\n\
+                     Use BOOTSTRAP_SKIP_TARGET_SANITY=1 to \
+                     bypass this check."
                 );
             }
         }
@@ -287,19 +291,19 @@ than building it.
         }
     }
 
-    for host in &build.hosts {
-        if !build.config.dry_run() {
+    if !build.config.dry_run() {
+        for host in &build.hosts {
             cmd_finder.must_have(build.cxx(*host).unwrap());
-        }
 
-        if build.config.llvm_enabled(*host) {
-            // Externally configured LLVM requires FileCheck to exist
-            let filecheck = build.llvm_filecheck(build.build);
-            if !filecheck.starts_with(&build.out)
-                && !filecheck.exists()
-                && build.config.codegen_tests
-            {
-                panic!("FileCheck executable {filecheck:?} does not exist");
+            if build.config.llvm_enabled(*host) {
+                // Externally configured LLVM requires FileCheck to exist
+                let filecheck = build.llvm_filecheck(build.build);
+                if !filecheck.starts_with(&build.out)
+                    && !filecheck.exists()
+                    && build.config.codegen_tests
+                {
+                    panic!("FileCheck executable {filecheck:?} does not exist");
+                }
             }
         }
     }
@@ -348,7 +352,8 @@ than building it.
             // There are three builds of cmake on windows: MSVC, MinGW, and
             // Cygwin. The Cygwin build does not have generators for Visual
             // Studio, so detect that here and error.
-            let out = output(Command::new("cmake").arg("--help"));
+            let out =
+                command("cmake").arg("--help").run_always().run_capture_stdout(build).stdout();
             if !out.contains("Visual Studio") {
                 panic!(
                     "

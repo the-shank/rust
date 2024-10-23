@@ -7,8 +7,9 @@ use clippy_utils::ty::{for_each_top_level_late_bound_region, is_copy};
 use clippy_utils::{get_attr, is_lint_allowed};
 use itertools::Itertools;
 use rustc_ast::Mutability;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::{Applicability, Diag};
-use rustc_hir::intravisit::{walk_expr, Visitor};
+use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{Arm, Expr, ExprKind, MatchSource};
 use rustc_lint::{LateContext, LintContext};
 use rustc_middle::ty::{GenericArgKind, Region, RegionKind, Ty, TyCtxt, TypeVisitable, TypeVisitor};
@@ -16,7 +17,7 @@ use rustc_span::Span;
 
 use super::SIGNIFICANT_DROP_IN_SCRUTINEE;
 
-pub(super) fn check<'tcx>(
+pub(super) fn check_match<'tcx>(
     cx: &LateContext<'tcx>,
     expr: &'tcx Expr<'tcx>,
     scrutinee: &'tcx Expr<'_>,
@@ -27,10 +28,89 @@ pub(super) fn check<'tcx>(
         return;
     }
 
-    let (suggestions, message) = has_significant_drop_in_scrutinee(cx, scrutinee, source);
+    let scrutinee = match (source, &scrutinee.kind) {
+        (MatchSource::ForLoopDesugar, ExprKind::Call(_, [e])) => e,
+        _ => scrutinee,
+    };
+
+    let message = if source == MatchSource::Normal {
+        "temporary with significant `Drop` in `match` scrutinee will live until the end of the `match` expression"
+    } else {
+        "temporary with significant `Drop` in `for` loop condition will live until the end of the `for` expression"
+    };
+
+    let arms = arms.iter().map(|arm| arm.body).collect::<Vec<_>>();
+
+    check(cx, expr, scrutinee, &arms, message, Suggestion::Emit);
+}
+
+pub(super) fn check_if_let<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+    scrutinee: &'tcx Expr<'_>,
+    if_then: &'tcx Expr<'_>,
+    if_else: Option<&'tcx Expr<'_>>,
+) {
+    if is_lint_allowed(cx, SIGNIFICANT_DROP_IN_SCRUTINEE, expr.hir_id) {
+        return;
+    }
+
+    let message =
+        "temporary with significant `Drop` in `if let` scrutinee will live until the end of the `if let` expression";
+
+    if let Some(if_else) = if_else {
+        check(cx, expr, scrutinee, &[if_then, if_else], message, Suggestion::Emit);
+    } else {
+        check(cx, expr, scrutinee, &[if_then], message, Suggestion::Emit);
+    }
+}
+
+pub(super) fn check_while_let<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+    scrutinee: &'tcx Expr<'_>,
+    body: &'tcx Expr<'_>,
+) {
+    if is_lint_allowed(cx, SIGNIFICANT_DROP_IN_SCRUTINEE, expr.hir_id) {
+        return;
+    }
+
+    check(
+        cx,
+        expr,
+        scrutinee,
+        &[body],
+        "temporary with significant `Drop` in `while let` scrutinee will live until the end of the `while let` expression",
+        // Don't emit wrong suggestions: We cannot fix the significant drop in the `while let` scrutinee by simply
+        // moving it out. We need to change the `while` to a `loop` instead.
+        Suggestion::DontEmit,
+    );
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Suggestion {
+    Emit,
+    DontEmit,
+}
+
+fn check<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+    scrutinee: &'tcx Expr<'_>,
+    arms: &[&'tcx Expr<'_>],
+    message: &'static str,
+    sugg: Suggestion,
+) {
+    let mut helper = SigDropHelper::new(cx);
+    let suggestions = helper.find_sig_drop(scrutinee);
+
     for found in suggestions {
         span_lint_and_then(cx, SIGNIFICANT_DROP_IN_SCRUTINEE, found.found_span, message, |diag| {
-            set_diagnostic(diag, cx, expr, found);
+            match sugg {
+                Suggestion::Emit => set_suggestion(diag, cx, expr, found),
+                Suggestion::DontEmit => (),
+            }
+
             let s = Span::new(expr.span.hi(), expr.span.hi(), expr.span.ctxt(), None);
             diag.span_label(s, "temporary lives until here");
             for span in has_significant_drop_in_arms(cx, arms) {
@@ -41,7 +121,7 @@ pub(super) fn check<'tcx>(
     }
 }
 
-fn set_diagnostic<'tcx>(diag: &mut Diag<'_, ()>, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>, found: FoundSigDrop) {
+fn set_suggestion<'tcx>(diag: &mut Diag<'_, ()>, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>, found: FoundSigDrop) {
     let original = snippet(cx, found.found_span, "..");
     let trailing_indent = " ".repeat(indent_of(cx, found.found_span).unwrap_or(0));
 
@@ -77,26 +157,6 @@ fn set_diagnostic<'tcx>(diag: &mut Diag<'_, ()>, cx: &LateContext<'tcx>, expr: &
         ],
         Applicability::MaybeIncorrect,
     );
-}
-
-/// If the expression is an `ExprKind::Match`, check if the scrutinee has a significant drop that
-/// may have a surprising lifetime.
-fn has_significant_drop_in_scrutinee<'tcx>(
-    cx: &LateContext<'tcx>,
-    scrutinee: &'tcx Expr<'tcx>,
-    source: MatchSource,
-) -> (Vec<FoundSigDrop>, &'static str) {
-    let mut helper = SigDropHelper::new(cx);
-    let scrutinee = match (source, &scrutinee.kind) {
-        (MatchSource::ForLoopDesugar, ExprKind::Call(_, [e])) => e,
-        _ => scrutinee,
-    };
-    let message = if source == MatchSource::Normal {
-        "temporary with significant `Drop` in `match` scrutinee will live until the end of the `match` expression"
-    } else {
-        "temporary with significant `Drop` in `for` loop condition will live until the end of the `for` expression"
-    };
-    (helper.find_sig_drop(scrutinee), message)
 }
 
 struct SigDropChecker<'a, 'tcx> {
@@ -173,7 +233,7 @@ impl<'a, 'tcx> SigDropChecker<'a, 'tcx> {
 enum SigDropHolder {
     /// No values with significant drop present in this expression.
     ///
-    /// Expressions that we've emited lints do not count.
+    /// Expressions that we've emitted lints do not count.
     None,
     /// Some field in this expression references to values with significant drop.
     ///
@@ -365,9 +425,9 @@ fn ty_has_erased_regions(ty: Ty<'_>) -> bool {
     ty.visit_with(&mut V).is_break()
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for SigDropHelper<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for SigDropHelper<'_, 'tcx> {
     fn visit_expr(&mut self, ex: &'tcx Expr<'_>) {
-        // We've emited a lint on some neighborhood expression. That lint will suggest to move out the
+        // We've emitted a lint on some neighborhood expression. That lint will suggest to move out the
         // _parent_ expression (not the expression itself). Since we decide to move out the parent
         // expression, it is pointless to continue to process the current expression.
         if self.sig_drop_holder == SigDropHolder::Moved {
@@ -391,7 +451,7 @@ impl<'a, 'tcx> Visitor<'tcx> for SigDropHelper<'a, 'tcx> {
                 ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _)
                     if lhs.hir_id == ex.hir_id && self.sig_drop_holder == SigDropHolder::Moved =>
                 {
-                    // Never move out only the assignee. Instead, we should always move out the whole assigment.
+                    // Never move out only the assignee. Instead, we should always move out the whole assignment.
                     self.replace_current_sig_drop(parent_ex.span, true, 0);
                 },
                 _ => {
@@ -416,27 +476,27 @@ impl<'a, 'tcx> Visitor<'tcx> for SigDropHelper<'a, 'tcx> {
 
 struct ArmSigDropHelper<'a, 'tcx> {
     sig_drop_checker: SigDropChecker<'a, 'tcx>,
-    found_sig_drop_spans: FxHashSet<Span>,
+    found_sig_drop_spans: FxIndexSet<Span>,
 }
 
 impl<'a, 'tcx> ArmSigDropHelper<'a, 'tcx> {
     fn new(cx: &'a LateContext<'tcx>) -> ArmSigDropHelper<'a, 'tcx> {
         ArmSigDropHelper {
             sig_drop_checker: SigDropChecker::new(cx),
-            found_sig_drop_spans: FxHashSet::<Span>::default(),
+            found_sig_drop_spans: FxIndexSet::<Span>::default(),
         }
     }
 }
 
-fn has_significant_drop_in_arms<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) -> FxHashSet<Span> {
+fn has_significant_drop_in_arms<'tcx>(cx: &LateContext<'tcx>, arms: &[&'tcx Expr<'_>]) -> FxIndexSet<Span> {
     let mut helper = ArmSigDropHelper::new(cx);
     for arm in arms {
-        helper.visit_expr(arm.body);
+        helper.visit_expr(arm);
     }
     helper.found_sig_drop_spans
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for ArmSigDropHelper<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for ArmSigDropHelper<'_, 'tcx> {
     fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) {
         if self.sig_drop_checker.is_sig_drop_expr(ex) {
             self.found_sig_drop_spans.insert(ex.span);

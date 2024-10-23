@@ -21,19 +21,20 @@
 //!
 //! [c]: https://rust-lang.github.io/chalk/book/canonical_queries/canonicalization.html
 
+use std::collections::hash_map::Entry;
+
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::Lock;
 use rustc_macros::{HashStable, TypeFoldable, TypeVisitable};
 pub use rustc_type_ir as ir;
 pub use rustc_type_ir::{CanonicalTyVarKind, CanonicalVarKind};
 use smallvec::SmallVec;
-use std::collections::hash_map::Entry;
 
 use crate::infer::MemberConstraint;
 use crate::mir::ConstraintCategory;
-use crate::ty::GenericArg;
-use crate::ty::{self, List, Ty, TyCtxt, TypeFlags, TypeVisitableExt};
+use crate::ty::{self, GenericArg, List, Ty, TyCtxt, TypeFlags, TypeVisitableExt};
 
+pub type CanonicalQueryInput<'tcx, V> = ir::CanonicalQueryInput<TyCtxt<'tcx>, V>;
 pub type Canonical<'tcx, V> = ir::Canonical<TyCtxt<'tcx>, V>;
 pub type CanonicalVarInfo<'tcx> = ir::CanonicalVarInfo<TyCtxt<'tcx>>;
 pub type CanonicalVarValues<'tcx> = ir::CanonicalVarValues<TyCtxt<'tcx>>;
@@ -182,7 +183,6 @@ impl<'tcx> CanonicalParamEnvCache<'tcx> {
                 max_universe: ty::UniverseIndex::ROOT,
                 variables: List::empty(),
                 value: key,
-                defining_opaque_types: ty::List::empty(),
             };
         }
 

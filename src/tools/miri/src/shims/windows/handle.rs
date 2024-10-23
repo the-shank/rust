@@ -1,5 +1,6 @@
-use rustc_target::abi::HasDataLayout;
 use std::mem::variant_count;
+
+use rustc_target::abi::HasDataLayout;
 
 use crate::*;
 
@@ -74,7 +75,7 @@ impl Handle {
     /// None of this layout is guaranteed to applications by Windows or Miri.
     fn to_packed(self) -> u32 {
         let disc_size = Self::packed_disc_size();
-        let data_size = u32::BITS.checked_sub(disc_size).unwrap();
+        let data_size = u32::BITS.strict_sub(disc_size);
 
         let discriminant = self.discriminant();
         let data = self.data();
@@ -103,7 +104,7 @@ impl Handle {
     /// see docs for `to_packed`
     fn from_packed(handle: u32) -> Option<Self> {
         let disc_size = Self::packed_disc_size();
-        let data_size = u32::BITS.checked_sub(disc_size).unwrap();
+        let data_size = u32::BITS.strict_sub(disc_size);
 
         // the lower `data_size` bits of this mask are 1
         #[allow(clippy::arithmetic_side_effects)] // cannot overflow
@@ -138,10 +139,10 @@ impl Handle {
             signed_handle as u32
         } else {
             // if a handle doesn't fit in an i32, it isn't valid.
-            return Ok(None);
+            return interp_ok(None);
         };
 
-        Ok(Self::from_packed(handle))
+        interp_ok(Self::from_packed(handle))
     }
 }
 
@@ -166,6 +167,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             _ => this.invalid_handle("CloseHandle")?,
         }
 
-        Ok(())
+        interp_ok(())
     }
 }

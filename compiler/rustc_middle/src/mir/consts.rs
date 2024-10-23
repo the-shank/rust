@@ -1,17 +1,17 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
+use either::Either;
 use rustc_hir::def_id::DefId;
 use rustc_macros::{HashStable, Lift, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
-use rustc_session::{config::RemapPathScopeComponents, RemapFileNameExt};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_session::RemapFileNameExt;
+use rustc_session::config::RemapPathScopeComponents;
+use rustc_span::{DUMMY_SP, Span};
 use rustc_target::abi::{HasDataLayout, Size};
 
-use crate::mir::interpret::{alloc_range, AllocId, ConstAllocation, ErrorHandled, Scalar};
-use crate::mir::{pretty_print_const_value, Promoted};
-use crate::ty::print::with_no_trimmed_paths;
-use crate::ty::GenericArgsRef;
-use crate::ty::ScalarInt;
-use crate::ty::{self, print::pretty_print_const, Ty, TyCtxt};
+use crate::mir::interpret::{AllocId, ConstAllocation, ErrorHandled, Scalar, alloc_range};
+use crate::mir::{Promoted, pretty_print_const_value};
+use crate::ty::print::{pretty_print_const, with_no_trimmed_paths};
+use crate::ty::{self, GenericArgsRef, ScalarInt, Ty, TyCtxt};
 
 ///////////////////////////////////////////////////////////////////////////
 /// Evaluated Constants
@@ -84,11 +84,11 @@ impl<'tcx> ConstValue<'tcx> {
     }
 
     pub fn try_to_scalar_int(&self) -> Option<ScalarInt> {
-        self.try_to_scalar()?.try_to_int().ok()
+        self.try_to_scalar()?.try_to_scalar_int().ok()
     }
 
     pub fn try_to_bits(&self, size: Size) -> Option<u128> {
-        self.try_to_scalar_int()?.try_to_bits(size).ok()
+        Some(self.try_to_scalar_int()?.to_bits(size))
     }
 
     pub fn try_to_bool(&self) -> Option<bool> {
@@ -96,7 +96,7 @@ impl<'tcx> ConstValue<'tcx> {
     }
 
     pub fn try_to_target_usize(&self, tcx: TyCtxt<'tcx>) -> Option<u64> {
-        self.try_to_scalar_int()?.try_to_target_usize(tcx).ok()
+        Some(self.try_to_scalar_int()?.to_target_usize(tcx))
     }
 
     pub fn try_to_bits_for_ty(
@@ -149,7 +149,7 @@ impl<'tcx> ConstValue<'tcx> {
                         /* read_provenance */ true,
                     )
                     .ok()?;
-                let ptr = ptr.to_pointer(&tcx).ok()?;
+                let ptr = ptr.to_pointer(&tcx).discard_err()?;
                 let len = a
                     .read_scalar(
                         &tcx,
@@ -157,7 +157,7 @@ impl<'tcx> ConstValue<'tcx> {
                         /* read_provenance */ false,
                     )
                     .ok()?;
-                let len = len.to_target_usize(&tcx).ok()?;
+                let len = len.to_target_usize(&tcx).discard_err()?;
                 if len == 0 {
                     return Some(&[]);
                 }
@@ -222,7 +222,9 @@ pub enum Const<'tcx> {
 }
 
 impl<'tcx> Const<'tcx> {
-    pub fn identity_unevaluated(
+    /// Creates an unevaluated const from a `DefId` for a const item.
+    /// The binders of the const item still need to be instantiated.
+    pub fn from_unevaluated(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
     ) -> ty::EarlyBinder<'tcx, Const<'tcx>> {
@@ -241,7 +243,7 @@ impl<'tcx> Const<'tcx> {
         match self {
             Const::Ty(ty, ct) => {
                 match ct.kind() {
-                    // Dont use the outter ty as on invalid code we can wind up with them not being the same.
+                    // Dont use the outer ty as on invalid code we can wind up with them not being the same.
                     // this then results in allowing const eval to add `1_i64 + 1_usize` in cases where the mir
                     // was originally `({N: usize} + 1_usize)` under `generic_const_exprs`.
                     ty::ConstKind::Value(ty, _) => ty,
@@ -300,7 +302,7 @@ impl<'tcx> Const<'tcx> {
 
     #[inline]
     pub fn try_to_bits(self, size: Size) -> Option<u128> {
-        self.try_to_scalar_int()?.try_to_bits(size).ok()
+        Some(self.try_to_scalar_int()?.to_bits(size))
     }
 
     #[inline]
@@ -319,26 +321,20 @@ impl<'tcx> Const<'tcx> {
             Const::Ty(_, c) => {
                 // We want to consistently have a "clean" value for type system constants (i.e., no
                 // data hidden in the padding), so we always go through a valtree here.
-                let (ty, val) = c.eval(tcx, param_env, span)?;
-                Ok(tcx.valtree_to_const_val((ty, val)))
+                match c.eval_valtree(tcx, param_env, span) {
+                    Ok((ty, val)) => Ok(tcx.valtree_to_const_val((ty, val))),
+                    Err(Either::Left(_bad_ty)) => Err(tcx
+                        .dcx()
+                        .delayed_bug("`mir::Const::eval` called on a non-valtree-compatible type")
+                        .into()),
+                    Err(Either::Right(e)) => Err(e),
+                }
             }
             Const::Unevaluated(uneval, _) => {
                 // FIXME: We might want to have a `try_eval`-like function on `Unevaluated`
                 tcx.const_eval_resolve(param_env, uneval, span)
             }
             Const::Val(val, _) => Ok(val),
-        }
-    }
-
-    /// Normalizes the constant to a value or an error if possible.
-    #[inline]
-    pub fn normalize(self, tcx: TyCtxt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> Self {
-        match self.eval(tcx, param_env, DUMMY_SP) {
-            Ok(val) => Self::Val(val, self.ty()),
-            Err(ErrorHandled::Reported(guar, _span)) => {
-                Self::Ty(Ty::new_error(tcx, guar.into()), ty::Const::new_error(tcx, guar.into()))
-            }
-            Err(ErrorHandled::TooGeneric(_span)) => self,
         }
     }
 
@@ -367,7 +363,7 @@ impl<'tcx> Const<'tcx> {
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
     ) -> Option<ScalarInt> {
-        self.try_eval_scalar(tcx, param_env)?.try_to_int().ok()
+        self.try_eval_scalar(tcx, param_env)?.try_to_scalar_int().ok()
     }
 
     #[inline]
@@ -375,7 +371,7 @@ impl<'tcx> Const<'tcx> {
         let int = self.try_eval_scalar_int(tcx, param_env)?;
         let size =
             tcx.layout_of(param_env.with_reveal_all_normalized(tcx).and(self.ty())).ok()?.size;
-        int.try_to_bits(size).ok()
+        Some(int.to_bits(size))
     }
 
     /// Panics if the value cannot be evaluated or doesn't contain a valid integer of the given type.
@@ -391,7 +387,7 @@ impl<'tcx> Const<'tcx> {
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
     ) -> Option<u64> {
-        self.try_eval_scalar_int(tcx, param_env)?.try_to_target_usize(tcx).ok()
+        Some(self.try_eval_scalar_int(tcx, param_env)?.to_target_usize(tcx))
     }
 
     #[inline]

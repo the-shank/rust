@@ -25,10 +25,10 @@
 use hir::def_id::LocalDefIdSet;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir as hir;
+use rustc_hir::Node;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::Node;
 use rustc_middle::bug;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::middle::privacy::{self, Level};
@@ -207,18 +207,21 @@ impl<'tcx> ReachableContext<'tcx> {
                     }
 
                     hir::ItemKind::Const(_, _, init) => {
-                        // Only things actually ending up in the final constant need to be reachable.
-                        // Everything else is either already available as `mir_for_ctfe`, or can't be used
-                        // by codegen anyway.
+                        // Only things actually ending up in the final constant value are reachable
+                        // for codegen. Everything else is only needed during const-eval, so even if
+                        // const-eval happens in a downstream crate, all they need is
+                        // `mir_for_ctfe`.
                         match self.tcx.const_eval_poly_to_alloc(item.owner_id.def_id.into()) {
                             Ok(alloc) => {
                                 let alloc = self.tcx.global_alloc(alloc.alloc_id).unwrap_memory();
                                 self.propagate_from_alloc(alloc);
                             }
-                            // Reachable generic constants will be inlined into other crates
-                            // unconditionally, so we need to make sure that their
-                            // contents are also reachable.
+                            // We can't figure out which value the constant will evaluate to. In
+                            // lieu of that, we have to consider everything mentioned in the const
+                            // initializer reachable, since it *may* end up in the final value.
                             Err(ErrorHandled::TooGeneric(_)) => self.visit_nested_body(init),
+                            // If there was an error evaluating the const, nothing can be reachable
+                            // via it, and anyway compilation will fail.
                             Err(ErrorHandled::Reported(..)) => {}
                         }
                     }
@@ -233,7 +236,6 @@ impl<'tcx> ReachableContext<'tcx> {
                     // worklist, as determined by the privacy pass
                     hir::ItemKind::ExternCrate(_)
                     | hir::ItemKind::Use(..)
-                    | hir::ItemKind::OpaqueTy(..)
                     | hir::ItemKind::TyAlias(..)
                     | hir::ItemKind::Macro(..)
                     | hir::ItemKind::Mod(..)
@@ -284,7 +286,8 @@ impl<'tcx> ReachableContext<'tcx> {
             | Node::Field(_)
             | Node::Ty(_)
             | Node::Crate(_)
-            | Node::Synthetic => {}
+            | Node::Synthetic
+            | Node::OpaqueTy(..) => {}
             _ => {
                 bug!(
                     "found unexpected node kind in worklist: {} ({:?})",
@@ -307,7 +310,7 @@ impl<'tcx> ReachableContext<'tcx> {
                 GlobalAlloc::Static(def_id) => {
                     self.propagate_item(Res::Def(self.tcx.def_kind(def_id), def_id))
                 }
-                GlobalAlloc::Function(instance) => {
+                GlobalAlloc::Function { instance, .. } => {
                     // Manually visit to actually see the instance's `DefId`. Type visitors won't see it
                     self.propagate_item(Res::Def(
                         self.tcx.def_kind(instance.def_id()),
@@ -315,11 +318,11 @@ impl<'tcx> ReachableContext<'tcx> {
                     ));
                     self.visit(instance.args);
                 }
-                GlobalAlloc::VTable(ty, trait_ref) => {
+                GlobalAlloc::VTable(ty, dyn_ty) => {
                     self.visit(ty);
                     // Manually visit to actually see the trait's `DefId`. Type visitors won't see it
-                    if let Some(trait_ref) = trait_ref {
-                        let ExistentialTraitRef { def_id, args } = trait_ref.skip_binder();
+                    if let Some(trait_ref) = dyn_ty.principal() {
+                        let ExistentialTraitRef { def_id, args, .. } = trait_ref.skip_binder();
                         self.visit_def_id(def_id, "", &"");
                         self.visit(args);
                     }
@@ -497,6 +500,6 @@ fn reachable_set(tcx: TyCtxt<'_>, (): ()) -> LocalDefIdSet {
     reachable_context.reachable_symbols
 }
 
-pub fn provide(providers: &mut Providers) {
+pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { reachable_set, ..*providers };
 }

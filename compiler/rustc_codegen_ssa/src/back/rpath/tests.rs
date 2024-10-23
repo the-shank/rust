@@ -1,7 +1,7 @@
-use super::RPathConfig;
-use super::{get_rpath_relative_to_output, minimize_rpaths, rpaths_to_flags};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+use super::{RPathConfig, get_rpath_relative_to_output, minimize_rpaths, rpaths_to_flags};
 
 #[test]
 fn test_rpaths_to_flags() {
@@ -37,7 +37,6 @@ fn test_rpath_relative() {
     if cfg!(target_os = "macos") {
         let config = &mut RPathConfig {
             libs: &[],
-            has_rpath: true,
             is_like_osx: true,
             linker_is_gnu: false,
             out_filename: PathBuf::from("bin/rustc"),
@@ -48,7 +47,6 @@ fn test_rpath_relative() {
         let config = &mut RPathConfig {
             libs: &[],
             out_filename: PathBuf::from("bin/rustc"),
-            has_rpath: true,
             is_like_osx: false,
             linker_is_gnu: true,
         };
@@ -62,7 +60,6 @@ fn test_rpath_relative_issue_119571() {
     let config = &mut RPathConfig {
         libs: &[],
         out_filename: PathBuf::from("rustc"),
-        has_rpath: true,
         is_like_osx: false,
         linker_is_gnu: true,
     };
@@ -77,13 +74,10 @@ fn test_rpath_relative_issue_119571() {
 fn test_xlinker() {
     let args = rpaths_to_flags(vec!["a/normal/path".into(), "a,comma,path".into()]);
 
-    assert_eq!(
-        args,
-        vec![
-            OsString::from("-Wl,-rpath,a/normal/path"),
-            OsString::from("-Wl,-rpath"),
-            OsString::from("-Xlinker"),
-            OsString::from("a,comma,path")
-        ]
-    );
+    assert_eq!(args, vec![
+        OsString::from("-Wl,-rpath,a/normal/path"),
+        OsString::from("-Wl,-rpath"),
+        OsString::from("-Xlinker"),
+        OsString::from("a,comma,path")
+    ]);
 }

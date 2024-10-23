@@ -3,11 +3,10 @@
 #[cfg(test)]
 mod tests;
 
-use crate::io::prelude::*;
-
 use crate::cell::{Cell, RefCell};
 use crate::fmt;
 use crate::fs::File;
+use crate::io::prelude::*;
 use crate::io::{
     self, BorrowedCursor, BufReader, IoSlice, IoSliceMut, LineWriter, Lines, SpecReadByte,
 };
@@ -371,7 +370,12 @@ impl Stdin {
     /// Locks this handle and reads a line of input, appending it to the specified buffer.
     ///
     /// For detailed semantics of this method, see the documentation on
-    /// [`BufRead::read_line`].
+    /// [`BufRead::read_line`]. In particular:
+    /// * Previous content of the buffer will be preserved. To avoid appending
+    ///   to the buffer, you need to [`clear`] it first.
+    /// * The trailing newline character, if any, is included in the buffer.
+    ///
+    /// [`clear`]: String::clear
     ///
     /// # Examples
     ///
@@ -395,6 +399,7 @@ impl Stdin {
     ///   in which case it will wait for the Enter key to be pressed before
     ///   continuing
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("get_line")]
     pub fn read_line(&self, buf: &mut String) -> io::Result<usize> {
         self.lock().read_line(buf)
     }
@@ -1092,7 +1097,7 @@ pub fn try_set_output_capture(
     OUTPUT_CAPTURE.try_with(move |slot| slot.replace(sink))
 }
 
-/// Write `args` to the capture buffer if enabled and possible, or `global_s`
+/// Writes `args` to the capture buffer if enabled and possible, or `global_s`
 /// otherwise. `label` identifies the stream in a panic message.
 ///
 /// This function is used to print error messages, so it takes extra

@@ -1,10 +1,12 @@
-use crate::mir;
-use crate::query::CyclePlaceholder;
-use crate::traits;
-use crate::ty::adjustment::CoerceUnsizedInfo;
-use crate::ty::{self, Ty};
 use std::intrinsics::transmute_unchecked;
 use std::mem::MaybeUninit;
+
+use rustc_span::ErrorGuaranteed;
+
+use crate::query::CyclePlaceholder;
+use crate::ty::adjustment::CoerceUnsizedInfo;
+use crate::ty::{self, Ty};
+use crate::{mir, traits};
 
 #[derive(Copy, Clone)]
 pub struct Erased<T: Copy> {
@@ -157,9 +159,10 @@ impl EraseType for Result<mir::ConstValue<'_>, mir::interpret::ErrorHandled> {
     type Result = [u8; size_of::<Result<mir::ConstValue<'static>, mir::interpret::ErrorHandled>>()];
 }
 
-impl EraseType for Result<Option<ty::ValTree<'_>>, mir::interpret::ErrorHandled> {
-    type Result =
-        [u8; size_of::<Result<Option<ty::ValTree<'static>>, mir::interpret::ErrorHandled>>()];
+impl EraseType for Result<Result<ty::ValTree<'_>, Ty<'_>>, mir::interpret::ErrorHandled> {
+    type Result = [u8; size_of::<
+        Result<Result<ty::ValTree<'static>, Ty<'static>>, mir::interpret::ErrorHandled>,
+    >()];
 }
 
 impl EraseType for Result<&'_ ty::List<Ty<'_>>, ty::util::AlwaysRequiresDrop> {
@@ -213,6 +216,10 @@ impl<T0, T1> EraseType for (&'_ T0, &'_ T1) {
 
 impl<T0, T1> EraseType for (&'_ T0, &'_ [T1]) {
     type Result = [u8; size_of::<(&'static (), &'static [()])>()];
+}
+
+impl<T0> EraseType for (&'_ T0, Result<(), ErrorGuaranteed>) {
+    type Result = [u8; size_of::<(&'static (), Result<(), ErrorGuaranteed>)>()];
 }
 
 macro_rules! trivial {
@@ -365,7 +372,7 @@ tcx_lifetime! {
     rustc_middle::ty::GenericPredicates,
     rustc_middle::ty::inhabitedness::InhabitedPredicate,
     rustc_middle::ty::Instance,
-    rustc_middle::ty::InstanceDef,
+    rustc_middle::ty::InstanceKind,
     rustc_middle::ty::layout::FnAbiError,
     rustc_middle::ty::layout::LayoutError,
     rustc_middle::ty::ParamEnv,

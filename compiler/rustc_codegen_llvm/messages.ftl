@@ -1,22 +1,9 @@
 codegen_llvm_copy_bitcode = failed to copy bitcode to object file: {$err}
 
-codegen_llvm_dlltool_fail_import_library =
-    Dlltool could not create import library with {$dlltool_path} {$dlltool_args}:
-    {$stdout}
-    {$stderr}
-
 codegen_llvm_dynamic_linking_with_lto =
     cannot prefer dynamic linking when performing LTO
     .note = only 'staticlib', 'bin', and 'cdylib' outputs are supported with LTO
 
-codegen_llvm_error_calling_dlltool =
-    Error calling dlltool '{$dlltool_path}': {$error}
-
-codegen_llvm_error_creating_import_library =
-    Error creating import library for {$lib_name}: {$error}
-
-codegen_llvm_error_writing_def_file =
-    Error writing .DEF file: {$error}
 
 codegen_llvm_fixed_x18_invalid_arch = the `-Zfixed-x18` flag is not supported on the `{$arch}` architecture
 
@@ -46,9 +33,6 @@ codegen_llvm_lto_proc_macro = lto cannot be used for `proc-macro` crate type wit
 codegen_llvm_mismatch_data_layout =
     data-layout for target `{$rustc_target}`, `{$rustc_layout}`, differs from LLVM target's `{$llvm_target}` default layout, `{$llvm_layout}`
 
-codegen_llvm_missing_features =
-    add the missing features in a `target_feature` attribute
-
 codegen_llvm_multiple_source_dicompileunit = multiple source DICompileUnits found
 codegen_llvm_multiple_source_dicompileunit_with_llvm_err = multiple source DICompileUnits found: {$llvm_err}
 
@@ -75,9 +59,6 @@ codegen_llvm_serialize_module_with_llvm_err = failed to serialize module {$name}
 
 codegen_llvm_symbol_already_defined =
     symbol `{$symbol_name}` is already defined
-
-codegen_llvm_target_feature_disable_or_enable =
-    the target features {$features} must all be either enabled or disabled together
 
 codegen_llvm_target_machine = could not create LLVM TargetMachine for triple: {$triple}
 codegen_llvm_target_machine_with_llvm_err = could not create LLVM TargetMachine for triple: {$triple}: {$llvm_err}

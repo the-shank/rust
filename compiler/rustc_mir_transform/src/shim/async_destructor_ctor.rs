@@ -7,9 +7,10 @@ use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, Body, CallSource, CastKind, Const, ConstOperand, ConstValue, Local,
-    LocalDecl, MirSource, Operand, Place, PlaceElem, Rvalue, SourceInfo, Statement, StatementKind,
-    Terminator, TerminatorKind, UnwindAction, UnwindTerminateReason, RETURN_PLACE,
+    BasicBlock, BasicBlockData, Body, CallSource, CastKind, CoercionSource, Const, ConstOperand,
+    ConstValue, Local, LocalDecl, MirSource, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue,
+    SourceInfo, Statement, StatementKind, Terminator, TerminatorKind, UnwindAction,
+    UnwindTerminateReason,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::util::{AsyncDropGlueMorphology, Discr};
@@ -19,10 +20,11 @@ use rustc_span::source_map::respan;
 use rustc_span::{Span, Symbol};
 use rustc_target::abi::{FieldIdx, VariantIdx};
 use rustc_target::spec::PanicStrategy;
+use tracing::debug;
 
 use super::{local_decls_for_sig, new_body};
 
-pub fn build_async_destructor_ctor_shim<'tcx>(
+pub(super) fn build_async_destructor_ctor_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     ty: Option<Ty<'tcx>>,
@@ -328,7 +330,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
     fn put_array_as_slice(&mut self, elem_ty: Ty<'tcx>) {
         let slice_ptr_ty = Ty::new_mut_ptr(self.tcx, Ty::new_slice(self.tcx, elem_ty));
         self.put_temp_rvalue(Rvalue::Cast(
-            CastKind::PointerCoercion(PointerCoercion::Unsize),
+            CastKind::PointerCoercion(PointerCoercion::Unsize, CoercionSource::Implicit),
             Operand::Copy(Self::SELF_PTR.into()),
             slice_ptr_ty,
         ))
@@ -343,7 +345,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
                 .tcx
                 .mk_place_elems(&[PlaceElem::Deref, PlaceElem::Field(field, field_ty)]),
         };
-        self.put_temp_rvalue(Rvalue::AddressOf(Mutability::Mut, place))
+        self.put_temp_rvalue(Rvalue::RawPtr(Mutability::Mut, place))
     }
 
     /// If given Self is an enum puts `to_drop: *mut FieldTy` on top of
@@ -363,7 +365,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
                 PlaceElem::Field(field, field_ty),
             ]),
         };
-        self.put_temp_rvalue(Rvalue::AddressOf(Mutability::Mut, place))
+        self.put_temp_rvalue(Rvalue::RawPtr(Mutability::Mut, place))
     }
 
     /// If given Self is an enum puts `to_drop: *mut FieldTy` on top of
@@ -451,19 +453,17 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
     }
 
     fn combine_sync_surface(&mut self) -> Ty<'tcx> {
-        self.apply_combinator(
-            1,
-            LangItem::AsyncDropSurfaceDropInPlace,
-            &[self.self_ty.unwrap().into()],
-        )
+        self.apply_combinator(1, LangItem::AsyncDropSurfaceDropInPlace, &[self
+            .self_ty
+            .unwrap()
+            .into()])
     }
 
     fn combine_deferred_drop_in_place(&mut self) -> Ty<'tcx> {
-        self.apply_combinator(
-            1,
-            LangItem::AsyncDropDeferredDropInPlace,
-            &[self.self_ty.unwrap().into()],
-        )
+        self.apply_combinator(1, LangItem::AsyncDropDeferredDropInPlace, &[self
+            .self_ty
+            .unwrap()
+            .into()])
     }
 
     fn combine_fuse(&mut self, inner_future_ty: Ty<'tcx>) -> Ty<'tcx> {
@@ -483,11 +483,11 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
     }
 
     fn combine_either(&mut self, other: Ty<'tcx>, matched: Ty<'tcx>) -> Ty<'tcx> {
-        self.apply_combinator(
-            4,
-            LangItem::AsyncDropEither,
-            &[other.into(), matched.into(), self.self_ty.unwrap().into()],
-        )
+        self.apply_combinator(4, LangItem::AsyncDropEither, &[
+            other.into(),
+            matched.into(),
+            self.self_ty.unwrap().into(),
+        ])
     }
 
     fn return_(mut self) -> Body<'tcx> {
@@ -529,7 +529,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
 
         last_bb.terminator = Some(Terminator { source_info, kind: TerminatorKind::Return });
 
-        let source = MirSource::from_instance(ty::InstanceDef::AsyncDropGlueCtorShim(
+        let source = MirSource::from_instance(ty::InstanceKind::AsyncDropGlueCtorShim(
             self.def_id,
             self.self_ty,
         ));
@@ -561,7 +561,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
 
             // If projection of Discriminant then compare with `Ty::discriminant_ty`
             if let ty::Alias(ty::Projection, ty::AliasTy { args, def_id, .. }) = expected_ty.kind()
-                && Some(*def_id) == self.tcx.lang_items().discriminant_type()
+                && self.tcx.is_lang_item(*def_id, LangItem::Discriminant)
                 && args.first().unwrap().as_type().unwrap().discriminant_ty(self.tcx) == operand_ty
             {
                 return;

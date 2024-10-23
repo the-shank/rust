@@ -3,9 +3,10 @@
  * building is complete.
  */
 
-use crate::mir::*;
 use rustc_hir as hir;
 use tracing::{debug, instrument};
+
+use crate::mir::*;
 
 #[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable)]
 pub struct PlaceTy<'tcx> {
@@ -54,7 +55,7 @@ impl<'tcx> PlaceTy<'tcx> {
     /// `PlaceElem`, where we can just use the `Ty` that is already
     /// stored inline on field projection elems.
     pub fn projection_ty(self, tcx: TyCtxt<'tcx>, elem: PlaceElem<'tcx>) -> PlaceTy<'tcx> {
-        self.projection_ty_core(tcx, ty::ParamEnv::empty(), &elem, |_, _, ty| ty, |_, ty| ty)
+        self.projection_ty_core(tcx, &elem, |_, _, ty| ty, |_, ty| ty)
     }
 
     /// `place_ty.projection_ty_core(tcx, elem, |...| { ... })`
@@ -65,7 +66,6 @@ impl<'tcx> PlaceTy<'tcx> {
     pub fn projection_ty_core<V, T>(
         self,
         tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
         elem: &ProjectionElem<V, T>,
         mut handle_field: impl FnMut(&Self, FieldIdx, T) -> Ty<'tcx>,
         mut handle_opaque_cast_and_subtype: impl FnMut(&Self, T) -> Ty<'tcx>,
@@ -92,7 +92,9 @@ impl<'tcx> PlaceTy<'tcx> {
                     ty::Slice(..) => self.ty,
                     ty::Array(inner, _) if !from_end => Ty::new_array(tcx, *inner, to - from),
                     ty::Array(inner, size) if from_end => {
-                        let size = size.eval_target_usize(tcx, param_env);
+                        let size = size
+                            .try_to_target_usize(tcx)
+                            .expect("expected subslice projection on fixed-size array");
                         let len = size - from - to;
                         Ty::new_array(tcx, *inner, len)
                     }
@@ -169,7 +171,7 @@ impl<'tcx> Rvalue<'tcx> {
                 let place_ty = place.ty(local_decls, tcx).ty;
                 Ty::new_ref(tcx, reg, place_ty, bk.to_mutbl_lossy())
             }
-            Rvalue::AddressOf(mutability, ref place) => {
+            Rvalue::RawPtr(mutability, ref place) => {
                 let place_ty = place.ty(local_decls, tcx).ty;
                 Ty::new_ptr(tcx, place_ty, mutability)
             }
@@ -289,19 +291,7 @@ impl<'tcx> UnOp {
     pub fn ty(&self, tcx: TyCtxt<'tcx>, arg_ty: Ty<'tcx>) -> Ty<'tcx> {
         match self {
             UnOp::Not | UnOp::Neg => arg_ty,
-            UnOp::PtrMetadata => {
-                let pointee_ty = arg_ty
-                    .builtin_deref(true)
-                    .unwrap_or_else(|| bug!("PtrMetadata of non-dereferenceable ty {arg_ty:?}"));
-                if pointee_ty.is_trivially_sized(tcx) {
-                    tcx.types.unit
-                } else {
-                    let Some(metadata_def_id) = tcx.lang_items().metadata_type() else {
-                        bug!("No metadata_type lang item while looking at {arg_ty:?}")
-                    };
-                    Ty::new_projection(tcx, metadata_def_id, [pointee_ty])
-                }
-            }
+            UnOp::PtrMetadata => arg_ty.pointee_metadata_ty_or_projection(tcx),
         }
     }
 }

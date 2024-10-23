@@ -19,13 +19,10 @@
 #![feature(never_type)]
 #![feature(pattern_types)]
 #![feature(prelude_import)]
-#![feature(raw_ref_op)]
 #![feature(specialization)]
 #![feature(trace_macros)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
-#![feature(unnamed_fields)]
-#![feature(unsafe_extern_blocks)]
 #![feature(yeet_expr)]
 #![allow(incomplete_features)]
 
@@ -786,20 +783,6 @@ mod types {
         let _: ();
         let _: (T,);
         let _: (T, T);
-    }
-
-    /// TyKind::AnonStruct
-    fn ty_anon_struct() {
-        struct Struct {
-            _: struct { t: T },
-        }
-    }
-
-    /// TyKind::AnonUnion
-    fn ty_anon_union() {
-        struct Struct {
-            _: union { t: T },
-        }
     }
 
     /// TyKind::Path

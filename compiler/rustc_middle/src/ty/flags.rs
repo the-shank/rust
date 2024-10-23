@@ -1,6 +1,6 @@
-use crate::ty::{self, InferConst, Ty, TypeFlags};
-use crate::ty::{GenericArg, GenericArgKind};
 use std::slice;
+
+use crate::ty::{self, GenericArg, GenericArgKind, InferConst, Ty, TypeFlags};
 
 #[derive(Debug)]
 pub struct FlagComputation {
@@ -250,9 +250,8 @@ impl FlagComputation {
                 self.add_args(args);
             }
 
-            &ty::FnPtr(fn_sig) => self.bound_computation(fn_sig, |computation, fn_sig| {
-                computation.add_tys(fn_sig.inputs());
-                computation.add_ty(fn_sig.output());
+            &ty::FnPtr(sig_tys, _) => self.bound_computation(sig_tys, |computation, sig_tys| {
+                computation.add_tys(sig_tys.inputs_and_output);
             }),
         }
     }
@@ -302,7 +301,7 @@ impl FlagComputation {
             ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(arg)) => {
                 self.add_args(slice::from_ref(&arg));
             }
-            ty::PredicateKind::ObjectSafe(_def_id) => {}
+            ty::PredicateKind::DynCompatible(_def_id) => {}
             ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(uv)) => {
                 self.add_const(uv);
             }

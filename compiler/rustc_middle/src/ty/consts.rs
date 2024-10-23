@@ -1,14 +1,16 @@
-use crate::middle::resolve_bound_vars as rbv;
-use crate::mir::interpret::{ErrorHandled, LitToConstInput, Scalar};
-use crate::ty::{self, GenericArgs, ParamEnv, ParamEnvAnd, Ty, TyCtxt, TypeVisitableExt};
+use either::Either;
 use rustc_data_structures::intern::Interned;
 use rustc_error_messages::MultiSpan;
-use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::{self as hir, HirId};
 use rustc_macros::HashStable;
 use rustc_type_ir::{self as ir, TypeFlags, WithCachedTypeInfo};
 use tracing::{debug, instrument};
+
+use crate::middle::resolve_bound_vars as rbv;
+use crate::mir::interpret::{ErrorHandled, LitToConstInput, Scalar};
+use crate::ty::{self, GenericArgs, ParamEnv, ParamEnvAnd, Ty, TyCtxt, TypeVisitableExt};
 
 mod int;
 mod kind;
@@ -16,8 +18,7 @@ mod valtree;
 
 pub use int::*;
 pub use kind::*;
-use rustc_span::Span;
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span};
 pub use valtree::*;
 
 pub type ConstKind<'tcx> = ir::ConstKind<TyCtxt<'tcx>>;
@@ -108,6 +109,7 @@ impl<'tcx> Const<'tcx> {
 
     #[inline]
     pub fn new_unevaluated(tcx: TyCtxt<'tcx>, uv: ty::UnevaluatedConst<'tcx>) -> Const<'tcx> {
+        tcx.debug_assert_args_compatible(uv.def, uv.args);
         Const::new(tcx, ty::ConstKind::Unevaluated(uv))
     }
 
@@ -176,18 +178,61 @@ impl<'tcx> rustc_type_ir::inherent::Const<TyCtxt<'tcx>> for Const<'tcx> {
     fn new_expr(interner: TyCtxt<'tcx>, expr: ty::Expr<'tcx>) -> Self {
         Const::new_expr(interner, expr)
     }
+
+    fn new_error(interner: TyCtxt<'tcx>, guar: ErrorGuaranteed) -> Self {
+        Const::new_error(interner, guar)
+    }
+}
+
+/// In some cases, [`hir::ConstArg`]s that are being used in the type system
+/// through const generics need to have their type "fed" to them
+/// using the query system.
+///
+/// Use this enum with [`Const::from_const_arg`] to instruct it with the
+/// desired behavior.
+#[derive(Debug, Clone, Copy)]
+pub enum FeedConstTy {
+    /// Feed the type.
+    ///
+    /// The `DefId` belongs to the const param that we are supplying
+    /// this (anon) const arg to.
+    Param(DefId),
+    /// Don't feed the type.
+    No,
 }
 
 impl<'tcx> Const<'tcx> {
+    /// Convert a [`hir::ConstArg`] to a [`ty::Const`](Self).
+    #[instrument(skip(tcx), level = "debug")]
+    pub fn from_const_arg(
+        tcx: TyCtxt<'tcx>,
+        const_arg: &'tcx hir::ConstArg<'tcx>,
+        feed: FeedConstTy,
+    ) -> Self {
+        if let FeedConstTy::Param(param_def_id) = feed
+            && let hir::ConstArgKind::Anon(anon) = &const_arg.kind
+        {
+            tcx.feed_anon_const_type(anon.def_id, tcx.type_of(param_def_id));
+        }
+
+        match const_arg.kind {
+            hir::ConstArgKind::Path(qpath) => {
+                // FIXME(min_generic_const_args): for now only params are lowered to ConstArgKind::Path
+                Self::from_param(tcx, qpath, const_arg.hir_id)
+            }
+            hir::ConstArgKind::Anon(anon) => Self::from_anon_const(tcx, anon.def_id),
+        }
+    }
+
     /// Literals and const generic parameters are eagerly converted to a constant, everything else
     /// becomes `Unevaluated`.
     #[instrument(skip(tcx), level = "debug")]
     pub fn from_anon_const(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Self {
         let body_id = match tcx.hir_node_by_def_id(def) {
             hir::Node::AnonConst(ac) => ac.body,
-            _ => span_bug!(
+            node => span_bug!(
                 tcx.def_span(def.to_def_id()),
-                "from_anon_const can only process anonymous constants"
+                "from_anon_const can only process anonymous constants, not {node:?}"
             ),
         };
 
@@ -198,13 +243,38 @@ impl<'tcx> Const<'tcx> {
 
         match Self::try_from_lit_or_param(tcx, ty, expr) {
             Some(v) => v,
-            None => ty::Const::new_unevaluated(
-                tcx,
-                ty::UnevaluatedConst {
-                    def: def.to_def_id(),
-                    args: GenericArgs::identity_for_item(tcx, def.to_def_id()),
-                },
-            ),
+            None => ty::Const::new_unevaluated(tcx, ty::UnevaluatedConst {
+                def: def.to_def_id(),
+                args: GenericArgs::identity_for_item(tcx, def.to_def_id()),
+            }),
+        }
+    }
+
+    /// Lower a const param to a [`Const`].
+    ///
+    /// IMPORTANT: `qpath` must be a const param, otherwise this will panic
+    fn from_param(tcx: TyCtxt<'tcx>, qpath: hir::QPath<'tcx>, hir_id: HirId) -> Self {
+        let hir::QPath::Resolved(_, &hir::Path { res: Res::Def(DefKind::ConstParam, def_id), .. }) =
+            qpath
+        else {
+            span_bug!(qpath.span(), "non-param {qpath:?} passed to Const::from_param")
+        };
+
+        match tcx.named_bound_var(hir_id) {
+            Some(rbv::ResolvedArg::EarlyBound(_)) => {
+                // Find the name and index of the const parameter by indexing the generics of
+                // the parent item and construct a `ParamConst`.
+                let item_def_id = tcx.parent(def_id);
+                let generics = tcx.generics_of(item_def_id);
+                let index = generics.param_def_id_to_index[&def_id];
+                let name = tcx.item_name(def_id);
+                ty::Const::new_param(tcx, ty::ParamConst::new(index, name))
+            }
+            Some(rbv::ResolvedArg::LateBound(debruijn, index, _)) => {
+                ty::Const::new_bound(tcx, debruijn, ty::BoundVar::from_u32(index))
+            }
+            Some(rbv::ResolvedArg::Error(guar)) => ty::Const::new_error(tcx, guar),
+            arg => bug!("unexpected bound var resolution for {:?}: {arg:?}", hir_id),
         }
     }
 
@@ -223,6 +293,14 @@ impl<'tcx> Const<'tcx> {
             _ => expr,
         };
 
+        if let hir::ExprKind::Path(hir::QPath::Resolved(
+            _,
+            &hir::Path { res: Res::Def(DefKind::ConstParam, _), .. },
+        )) = expr.kind
+        {
+            span_bug!(expr.span, "try_from_lit: received const param which shouldn't be possible");
+        };
+
         let lit_input = match expr.kind {
             hir::ExprKind::Lit(lit) => Some(LitToConstInput { lit: &lit.node, ty, neg: false }),
             hir::ExprKind::Unary(hir::UnOp::Neg, expr) => match expr.kind {
@@ -237,6 +315,10 @@ impl<'tcx> Const<'tcx> {
             // mir.
             match tcx.at(expr.span).lit_to_const(lit_input) {
                 Ok(c) => return Some(c),
+                Err(_) if lit_input.ty.has_aliases() => {
+                    // allow the `ty` to be an alias type, though we cannot handle it here
+                    return None;
+                }
                 Err(e) => {
                     tcx.dcx().span_delayed_bug(
                         expr.span,
@@ -246,34 +328,7 @@ impl<'tcx> Const<'tcx> {
             }
         }
 
-        // FIXME(const_generics): We currently have to special case parameters because `min_const_generics`
-        // does not provide the parents generics to anonymous constants. We still allow generic const
-        // parameters by themselves however, e.g. `N`. These constants would cause an ICE if we were to
-        // ever try to instantiate the generic parameters in their bodies.
-        match expr.kind {
-            hir::ExprKind::Path(hir::QPath::Resolved(
-                _,
-                &hir::Path { res: Res::Def(DefKind::ConstParam, def_id), .. },
-            )) => {
-                match tcx.named_bound_var(expr.hir_id) {
-                    Some(rbv::ResolvedArg::EarlyBound(_)) => {
-                        // Find the name and index of the const parameter by indexing the generics of
-                        // the parent item and construct a `ParamConst`.
-                        let item_def_id = tcx.parent(def_id);
-                        let generics = tcx.generics_of(item_def_id);
-                        let index = generics.param_def_id_to_index[&def_id];
-                        let name = tcx.item_name(def_id);
-                        Some(ty::Const::new_param(tcx, ty::ParamConst::new(index, name)))
-                    }
-                    Some(rbv::ResolvedArg::LateBound(debruijn, index, _)) => {
-                        Some(ty::Const::new_bound(tcx, debruijn, ty::BoundVar::from_u32(index)))
-                    }
-                    Some(rbv::ResolvedArg::Error(guar)) => Some(ty::Const::new_error(tcx, guar)),
-                    arg => bug!("unexpected bound var resolution for {:?}: {arg:?}", expr.hir_id),
-                }
-            }
-            _ => None,
-        }
+        None
     }
 
     #[inline]
@@ -308,14 +363,16 @@ impl<'tcx> Const<'tcx> {
         Self::from_bits(tcx, n as u128, ParamEnv::empty().and(tcx.types.usize))
     }
 
-    /// Returns the evaluated constant
+    /// Returns the evaluated constant as a valtree;
+    /// if that fails due to a valtree-incompatible type, indicate which type that is
+    /// by returning `Err(Left(bad_type))`.
     #[inline]
-    pub fn eval(
+    pub fn eval_valtree(
         self,
         tcx: TyCtxt<'tcx>,
         param_env: ParamEnv<'tcx>,
         span: Span,
-    ) -> Result<(Ty<'tcx>, ValTree<'tcx>), ErrorHandled> {
+    ) -> Result<(Ty<'tcx>, ValTree<'tcx>), Either<Ty<'tcx>, ErrorHandled>> {
         assert!(!self.has_escaping_bound_vars(), "escaping vars in {self:?}");
         match self.kind() {
             ConstKind::Unevaluated(unevaluated) => {
@@ -324,127 +381,83 @@ impl<'tcx> Const<'tcx> {
                 let (param_env, unevaluated) = unevaluated.prepare_for_eval(tcx, param_env);
                 // try to resolve e.g. associated constants to their definition on an impl, and then
                 // evaluate the const.
-                let Some(c) = tcx.const_eval_resolve_for_typeck(param_env, unevaluated, span)?
-                else {
-                    // This can happen when we run on ill-typed code.
-                    let e = tcx.dcx().span_delayed_bug(
-                        span,
-                        "`ty::Const::eval` called on a non-valtree-compatible type",
-                    );
-                    return Err(e.into());
-                };
-                Ok((tcx.type_of(unevaluated.def).instantiate(tcx, unevaluated.args), c))
+                match tcx.const_eval_resolve_for_typeck(param_env, unevaluated, span) {
+                    Ok(Ok(c)) => {
+                        Ok((tcx.type_of(unevaluated.def).instantiate(tcx, unevaluated.args), c))
+                    }
+                    Ok(Err(bad_ty)) => Err(Either::Left(bad_ty)),
+                    Err(err) => Err(Either::Right(err)),
+                }
             }
             ConstKind::Value(ty, val) => Ok((ty, val)),
-            ConstKind::Error(g) => Err(g.into()),
+            ConstKind::Error(g) => Err(Either::Right(g.into())),
             ConstKind::Param(_)
             | ConstKind::Infer(_)
             | ConstKind::Bound(_, _)
             | ConstKind::Placeholder(_)
-            | ConstKind::Expr(_) => Err(ErrorHandled::TooGeneric(span)),
+            | ConstKind::Expr(_) => Err(Either::Right(ErrorHandled::TooGeneric(span))),
         }
     }
 
     /// Normalizes the constant to a value or an error if possible.
     #[inline]
-    pub fn normalize(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Self {
-        match self.eval(tcx, param_env, DUMMY_SP) {
+    pub fn normalize_internal(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Self {
+        match self.eval_valtree(tcx, param_env, DUMMY_SP) {
             Ok((ty, val)) => Self::new_value(tcx, val, ty),
-            Err(ErrorHandled::Reported(r, _span)) => Self::new_error(tcx, r.into()),
-            Err(ErrorHandled::TooGeneric(_span)) => self,
+            Err(Either::Left(_bad_ty)) => {
+                // This can happen when we run on ill-typed code.
+                Self::new_error(
+                    tcx,
+                    tcx.dcx()
+                        .delayed_bug("`ty::Const::eval` called on a non-valtree-compatible type"),
+                )
+            }
+            Err(Either::Right(ErrorHandled::Reported(r, _span))) => Self::new_error(tcx, r.into()),
+            Err(Either::Right(ErrorHandled::TooGeneric(_span))) => self,
         }
     }
 
-    #[inline]
-    pub fn try_eval_scalar(
-        self,
-        tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-    ) -> Option<(Ty<'tcx>, Scalar)> {
-        let (ty, val) = self.eval(tcx, param_env, DUMMY_SP).ok()?;
-        let val = val.try_to_scalar()?;
-        Some((ty, val))
-    }
-
-    #[inline]
-    /// Attempts to evaluate the given constant to bits. Can fail to evaluate in the presence of
-    /// generics (or erroneous code) or if the value can't be represented as bits (e.g. because it
-    /// contains const generic parameters or pointers).
-    pub fn try_eval_scalar_int(
-        self,
-        tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
-    ) -> Option<(Ty<'tcx>, ScalarInt)> {
-        let (ty, scalar) = self.try_eval_scalar(tcx, param_env)?;
-        let val = scalar.try_to_int().ok()?;
-        Some((ty, val))
-    }
-
-    #[inline]
-    /// Attempts to evaluate the given constant to bits. Can fail to evaluate in the presence of
-    /// generics (or erroneous code) or if the value can't be represented as bits (e.g. because it
-    /// contains const generic parameters or pointers).
-    pub fn try_eval_bits(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Option<u128> {
-        let (ty, scalar) = self.try_eval_scalar_int(tcx, param_env)?;
-        let size = tcx.layout_of(param_env.with_reveal_all_normalized(tcx).and(ty)).ok()?.size;
-        // if `ty` does not depend on generic parameters, use an empty param_env
-        scalar.try_to_bits(size).ok()
-    }
-
-    #[inline]
-    /// Panics if the value cannot be evaluated or doesn't contain a valid integer of the given type.
-    pub fn eval_bits(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> u128 {
-        self.try_eval_bits(tcx, param_env)
-            .unwrap_or_else(|| bug!("failed to evalate {:#?} to bits", self))
-    }
-
-    #[inline]
-    pub fn try_eval_target_usize(
-        self,
-        tcx: TyCtxt<'tcx>,
-        param_env: ParamEnv<'tcx>,
-    ) -> Option<u64> {
-        let (_, scalar) = self.try_eval_scalar_int(tcx, param_env)?;
-        scalar.try_to_target_usize(tcx).ok()
-    }
-
-    #[inline]
-    pub fn try_eval_bool(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Option<bool> {
-        let (_, scalar) = self.try_eval_scalar_int(tcx, param_env)?;
-        scalar.try_into().ok()
-    }
-
-    #[inline]
-    /// Panics if the value cannot be evaluated or doesn't contain a valid `usize`.
-    pub fn eval_target_usize(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> u64 {
-        self.try_eval_target_usize(tcx, param_env)
-            .unwrap_or_else(|| bug!("expected usize, got {:#?}", self))
-    }
-
     /// Panics if self.kind != ty::ConstKind::Value
-    pub fn to_valtree(self) -> ty::ValTree<'tcx> {
+    pub fn to_valtree(self) -> (ty::ValTree<'tcx>, Ty<'tcx>) {
         match self.kind() {
-            ty::ConstKind::Value(_, valtree) => valtree,
+            ty::ConstKind::Value(ty, valtree) => (valtree, ty),
             _ => bug!("expected ConstKind::Value, got {:?}", self.kind()),
         }
     }
 
     /// Attempts to convert to a `ValTree`
-    pub fn try_to_valtree(self) -> Option<ty::ValTree<'tcx>> {
+    pub fn try_to_valtree(self) -> Option<(ty::ValTree<'tcx>, Ty<'tcx>)> {
         match self.kind() {
-            ty::ConstKind::Value(_, valtree) => Some(valtree),
+            ty::ConstKind::Value(ty, valtree) => Some((valtree, ty)),
             _ => None,
         }
     }
 
     #[inline]
-    pub fn try_to_scalar(self) -> Option<Scalar> {
-        self.try_to_valtree()?.try_to_scalar()
+    pub fn try_to_scalar(self) -> Option<(Scalar, Ty<'tcx>)> {
+        let (valtree, ty) = self.try_to_valtree()?;
+        Some((valtree.try_to_scalar()?, ty))
+    }
+
+    pub fn try_to_bool(self) -> Option<bool> {
+        self.try_to_valtree()?.0.try_to_scalar_int()?.try_to_bool().ok()
     }
 
     #[inline]
     pub fn try_to_target_usize(self, tcx: TyCtxt<'tcx>) -> Option<u64> {
-        self.try_to_valtree()?.try_to_target_usize(tcx)
+        self.try_to_valtree()?.0.try_to_target_usize(tcx)
+    }
+
+    #[inline]
+    /// Attempts to evaluate the given constant to bits. Can fail to evaluate in the presence of
+    /// generics (or erroneous code) or if the value can't be represented as bits (e.g. because it
+    /// contains const generic parameters or pointers).
+    pub fn try_to_bits(self, tcx: TyCtxt<'tcx>, param_env: ParamEnv<'tcx>) -> Option<u128> {
+        let (scalar, ty) = self.try_to_scalar()?;
+        let scalar = scalar.try_to_scalar_int().ok()?;
+        let size = tcx.layout_of(param_env.with_reveal_all_normalized(tcx).and(ty)).ok()?.size;
+        // if `ty` does not depend on generic parameters, use an empty param_env
+        Some(scalar.to_bits(size))
     }
 
     pub fn is_ct_infer(self) -> bool {
@@ -456,15 +469,15 @@ pub fn const_param_default<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
 ) -> ty::EarlyBinder<'tcx, Const<'tcx>> {
-    let default_def_id = match tcx.hir_node_by_def_id(def_id) {
+    let default_ct = match tcx.hir_node_by_def_id(def_id) {
         hir::Node::GenericParam(hir::GenericParam {
-            kind: hir::GenericParamKind::Const { default: Some(ac), .. },
+            kind: hir::GenericParamKind::Const { default: Some(ct), .. },
             ..
-        }) => ac.def_id,
+        }) => ct,
         _ => span_bug!(
             tcx.def_span(def_id),
             "`const_param_default` expected a generic parameter with a constant"
         ),
     };
-    ty::EarlyBinder::bind(Const::from_anon_const(tcx, default_def_id))
+    ty::EarlyBinder::bind(Const::from_const_arg(tcx, default_ct, FeedConstTy::No))
 }

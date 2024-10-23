@@ -1,29 +1,23 @@
-use std::cmp;
 use std::collections::BTreeSet;
-use std::iter;
 use std::num::NonZero;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::{cmp, iter};
 
 use rand::RngCore;
-
-use rustc_apfloat::ieee::{Double, Single};
 use rustc_apfloat::Float;
-use rustc_hir::{
-    def::{DefKind, Namespace},
-    def_id::{CrateNum, DefId, CRATE_DEF_INDEX, LOCAL_CRATE},
-};
+use rustc_apfloat::ieee::{Double, Half, Quad, Single};
+use rustc_hir::Safety;
+use rustc_hir::def::{DefKind, Namespace};
+use rustc_hir::def_id::{CRATE_DEF_INDEX, CrateNum, DefId, LOCAL_CRATE};
 use rustc_index::IndexVec;
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
-use rustc_middle::mir;
-use rustc_middle::ty::{
-    self,
-    layout::{LayoutOf, TyAndLayout},
-    FloatTy, IntTy, Ty, TyCtxt, UintTy,
-};
+use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, MaybeResult, TyAndLayout};
+use rustc_middle::ty::{self, FloatTy, IntTy, Ty, TyCtxt, UintTy};
 use rustc_session::config::CrateType;
-use rustc_span::{sym, Span, Symbol};
+use rustc_span::{Span, Symbol};
 use rustc_target::abi::{Align, FieldIdx, FieldsShape, Size, Variants};
 use rustc_target::spec::abi::Abi;
 
@@ -35,65 +29,6 @@ pub enum AccessKind {
     Read,
     Write,
 }
-
-// This mapping should match `decode_error_kind` in
-// <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/pal/unix/mod.rs>.
-const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
-    use std::io::ErrorKind::*;
-    &[
-        ("E2BIG", ArgumentListTooLong),
-        ("EADDRINUSE", AddrInUse),
-        ("EADDRNOTAVAIL", AddrNotAvailable),
-        ("EBUSY", ResourceBusy),
-        ("ECONNABORTED", ConnectionAborted),
-        ("ECONNREFUSED", ConnectionRefused),
-        ("ECONNRESET", ConnectionReset),
-        ("EDEADLK", Deadlock),
-        ("EDQUOT", FilesystemQuotaExceeded),
-        ("EEXIST", AlreadyExists),
-        ("EFBIG", FileTooLarge),
-        ("EHOSTUNREACH", HostUnreachable),
-        ("EINTR", Interrupted),
-        ("EINVAL", InvalidInput),
-        ("EISDIR", IsADirectory),
-        ("ELOOP", FilesystemLoop),
-        ("ENOENT", NotFound),
-        ("ENOMEM", OutOfMemory),
-        ("ENOSPC", StorageFull),
-        ("ENOSYS", Unsupported),
-        ("EMLINK", TooManyLinks),
-        ("ENAMETOOLONG", InvalidFilename),
-        ("ENETDOWN", NetworkDown),
-        ("ENETUNREACH", NetworkUnreachable),
-        ("ENOTCONN", NotConnected),
-        ("ENOTDIR", NotADirectory),
-        ("ENOTEMPTY", DirectoryNotEmpty),
-        ("EPIPE", BrokenPipe),
-        ("EROFS", ReadOnlyFilesystem),
-        ("ESPIPE", NotSeekable),
-        ("ESTALE", StaleNetworkFileHandle),
-        ("ETIMEDOUT", TimedOut),
-        ("ETXTBSY", ExecutableFileBusy),
-        ("EXDEV", CrossesDevices),
-        // The following have two valid options. We have both for the forwards mapping; only the
-        // first one will be used for the backwards mapping.
-        ("EPERM", PermissionDenied),
-        ("EACCES", PermissionDenied),
-        ("EWOULDBLOCK", WouldBlock),
-        ("EAGAIN", WouldBlock),
-    ]
-};
-// This mapping should match `decode_error_kind` in
-// <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/pal/windows/mod.rs>.
-const WINDOWS_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
-    use std::io::ErrorKind::*;
-    // FIXME: this is still incomplete.
-    &[
-        ("ERROR_ACCESS_DENIED", PermissionDenied),
-        ("ERROR_FILE_NOT_FOUND", NotFound),
-        ("ERROR_INVALID_PARAMETER", InvalidInput),
-    ]
-};
 
 /// Gets an instance for a path.
 ///
@@ -158,27 +93,73 @@ fn try_resolve_did(tcx: TyCtxt<'_>, path: &[&str], namespace: Option<Namespace>)
     None
 }
 
+/// Gets an instance for a path; fails gracefully if the path does not exist.
+pub fn try_resolve_path<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    path: &[&str],
+    namespace: Namespace,
+) -> Option<ty::Instance<'tcx>> {
+    let did = try_resolve_did(tcx, path, Some(namespace))?;
+    Some(ty::Instance::mono(tcx, did))
+}
+
+/// Gets an instance for a path.
+#[track_caller]
+pub fn resolve_path<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    path: &[&str],
+    namespace: Namespace,
+) -> ty::Instance<'tcx> {
+    try_resolve_path(tcx, path, namespace)
+        .unwrap_or_else(|| panic!("failed to find required Rust item: {path:?}"))
+}
+
+/// Gets the layout of a type at a path.
+#[track_caller]
+pub fn path_ty_layout<'tcx>(cx: &impl LayoutOf<'tcx>, path: &[&str]) -> TyAndLayout<'tcx> {
+    let ty =
+        resolve_path(cx.tcx(), path, Namespace::TypeNS).ty(cx.tcx(), ty::ParamEnv::reveal_all());
+    cx.layout_of(ty).to_result().ok().unwrap()
+}
+
 /// Call `f` for each exported symbol.
 pub fn iter_exported_symbols<'tcx>(
     tcx: TyCtxt<'tcx>,
     mut f: impl FnMut(CrateNum, DefId) -> InterpResult<'tcx>,
 ) -> InterpResult<'tcx> {
+    // First, the symbols in the local crate. We can't use `exported_symbols` here as that
+    // skips `#[used]` statics (since `reachable_set` skips them in binary crates).
+    // So we walk all HIR items ourselves instead.
+    let crate_items = tcx.hir_crate_items(());
+    for def_id in crate_items.definitions() {
+        let exported = tcx.def_kind(def_id).has_codegen_attrs() && {
+            let codegen_attrs = tcx.codegen_fn_attrs(def_id);
+            codegen_attrs.contains_extern_indicator()
+                || codegen_attrs.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL)
+                || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED)
+                || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
+        };
+        if exported {
+            f(LOCAL_CRATE, def_id.into())?;
+        }
+    }
+
+    // Next, all our dependencies.
     // `dependency_formats` includes all the transitive informations needed to link a crate,
     // which is what we need here since we need to dig out `exported_symbols` from all transitive
     // dependencies.
     let dependency_formats = tcx.dependency_formats(());
+    // Find the dependencies of the executable we are running.
     let dependency_format = dependency_formats
         .iter()
         .find(|(crate_type, _)| *crate_type == CrateType::Executable)
         .expect("interpreting a non-executable crate");
-    for cnum in iter::once(LOCAL_CRATE).chain(dependency_format.1.iter().enumerate().filter_map(
-        |(num, &linkage)| {
-            // We add 1 to the number because that's what rustc also does everywhere it
-            // calls `CrateNum::new`...
-            #[allow(clippy::arithmetic_side_effects)]
-            (linkage != Linkage::NotLinked).then_some(CrateNum::new(num + 1))
-        },
-    )) {
+    for cnum in dependency_format.1.iter().enumerate().filter_map(|(num, &linkage)| {
+        // We add 1 to the number because that's what rustc also does everywhere it
+        // calls `CrateNum::new`...
+        #[allow(clippy::arithmetic_side_effects)]
+        (linkage != Linkage::NotLinked).then_some(CrateNum::new(num + 1))
+    }) {
         // We can ignore `_export_info` here: we are a Rust crate, and everything is exported
         // from a Rust crate.
         for &(symbol, _export_info) in tcx.exported_symbols(cnum) {
@@ -187,7 +168,7 @@ pub fn iter_exported_symbols<'tcx>(
             }
         }
     }
-    Ok(())
+    interp_ok(())
 }
 
 /// Convert a softfloat type to its corresponding hostfloat type.
@@ -241,28 +222,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         try_resolve_did(*self.eval_context_ref().tcx, path, None).is_some()
     }
 
-    /// Gets an instance for a path; fails gracefully if the path does not exist.
-    fn try_resolve_path(&self, path: &[&str], namespace: Namespace) -> Option<ty::Instance<'tcx>> {
-        let tcx = self.eval_context_ref().tcx.tcx;
-        let did = try_resolve_did(tcx, path, Some(namespace))?;
-        Some(ty::Instance::mono(tcx, did))
-    }
-
-    /// Gets an instance for a path.
-    fn resolve_path(&self, path: &[&str], namespace: Namespace) -> ty::Instance<'tcx> {
-        self.try_resolve_path(path, namespace)
-            .unwrap_or_else(|| panic!("failed to find required Rust item: {path:?}"))
-    }
-
     /// Evaluates the scalar at the specified path.
-    fn eval_path(&self, path: &[&str]) -> OpTy<'tcx> {
+    fn eval_path(&self, path: &[&str]) -> MPlaceTy<'tcx> {
         let this = self.eval_context_ref();
-        let instance = this.resolve_path(path, Namespace::ValueNS);
+        let instance = resolve_path(*this.tcx, path, Namespace::ValueNS);
         // We don't give a span -- this isn't actually used directly by the program anyway.
-        let const_val = this.eval_global(instance).unwrap_or_else(|err| {
+        this.eval_global(instance).unwrap_or_else(|err| {
             panic!("failed to evaluate required Rust item: {path:?}\n{err:?}")
-        });
-        const_val.into()
+        })
     }
     fn eval_path_scalar(&self, path: &[&str]) -> Scalar {
         let this = self.eval_context_ref();
@@ -273,6 +240,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     /// Helper function to get a `libc` constant as a `Scalar`.
     fn eval_libc(&self, name: &str) -> Scalar {
+        if self.eval_context_ref().tcx.sess.target.os == "windows" {
+            panic!(
+                "`libc` crate is not reliably available on Windows targets; Miri should not use it there"
+            );
+        }
         self.eval_path_scalar(&["libc", name])
     }
 
@@ -316,19 +288,26 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Helper function to get the `TyAndLayout` of a `libc` type
     fn libc_ty_layout(&self, name: &str) -> TyAndLayout<'tcx> {
         let this = self.eval_context_ref();
-        let ty = this
-            .resolve_path(&["libc", name], Namespace::TypeNS)
-            .ty(*this.tcx, ty::ParamEnv::reveal_all());
-        this.layout_of(ty).unwrap()
+        if this.tcx.sess.target.os == "windows" {
+            panic!(
+                "`libc` crate is not reliably available on Windows targets; Miri should not use it there"
+            );
+        }
+        path_ty_layout(this, &["libc", name])
     }
 
     /// Helper function to get the `TyAndLayout` of a `windows` type
     fn windows_ty_layout(&self, name: &str) -> TyAndLayout<'tcx> {
         let this = self.eval_context_ref();
-        let ty = this
-            .resolve_path(&["std", "sys", "pal", "windows", "c", name], Namespace::TypeNS)
-            .ty(*this.tcx, ty::ParamEnv::reveal_all());
-        this.layout_of(ty).unwrap()
+        path_ty_layout(this, &["std", "sys", "pal", "windows", "c", name])
+    }
+
+    /// Helper function to get `TyAndLayout` of an array that consists of `libc` type.
+    fn libc_array_ty_layout(&self, name: &str, size: u64) -> TyAndLayout<'tcx> {
+        let this = self.eval_context_ref();
+        let elem_ty_layout = this.libc_ty_layout(name);
+        let array_ty = Ty::new_array(*this.tcx, elem_ty_layout.ty, size);
+        this.layout_of(array_ty).unwrap()
     }
 
     /// Project to the given *named* field (which must be a struct or union type).
@@ -391,7 +370,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let field = this.project_field(dest, idx)?;
             this.write_int(val, &field)?;
         }
-        Ok(())
+        interp_ok(())
     }
 
     /// Write the given fields of the given place.
@@ -405,7 +384,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let field = this.project_field_named(dest, name)?;
             this.write_int(val, &field)?;
         }
-        Ok(())
+        interp_ok(())
     }
 
     /// Write a 0 of the appropriate size to `dest`.
@@ -415,7 +394,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     /// Test if this pointer equals 0.
     fn ptr_is_null(&self, ptr: Pointer) -> InterpResult<'tcx, bool> {
-        Ok(ptr.addr().bytes() == 0)
+        interp_ok(ptr.addr().bytes() == 0)
     }
 
     /// Generate some random bytes, and write them to `dest`.
@@ -426,7 +405,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // any additional checks - it's okay if the pointer is invalid,
         // since we wouldn't actually be writing to it.
         if len == 0 {
-            return Ok(());
+            return interp_ok(());
         }
         let this = self.eval_context_mut();
 
@@ -453,48 +432,38 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         f: ty::Instance<'tcx>,
         caller_abi: Abi,
-        args: &[Immediate<Provenance>],
+        args: &[ImmTy<'tcx>],
         dest: Option<&MPlaceTy<'tcx>>,
         stack_pop: StackPopCleanup,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-        let param_env = ty::ParamEnv::reveal_all(); // in Miri this is always the param_env we use... and this.param_env is private.
-        let callee_abi = f.ty(*this.tcx, param_env).fn_sig(*this.tcx).abi();
-        if callee_abi != caller_abi {
-            throw_ub_format!(
-                "calling a function with ABI {} using caller ABI {}",
-                callee_abi.name(),
-                caller_abi.name()
-            )
-        }
 
-        // Push frame.
+        // Get MIR.
         let mir = this.load_mir(f.def, None)?;
         let dest = match dest {
             Some(dest) => dest.clone(),
             None => MPlaceTy::fake_alloc_zst(this.layout_of(mir.return_ty())?),
         };
-        this.push_stack_frame(f, mir, &dest, stack_pop)?;
 
-        // Initialize arguments.
-        let mut callee_args = this.frame().body.args_iter();
-        for arg in args {
-            let local = callee_args
-                .next()
-                .ok_or_else(|| err_ub_format!("callee has fewer arguments than expected"))?;
-            // Make the local live, and insert the initial value.
-            this.storage_live(local)?;
-            let callee_arg = this.local_to_place(local)?;
-            this.write_immediate(*arg, &callee_arg)?;
-        }
-        if callee_args.next().is_some() {
-            throw_ub_format!("callee has more arguments than expected");
-        }
+        // Construct a function pointer type representing the caller perspective.
+        let sig = this.tcx.mk_fn_sig(
+            args.iter().map(|a| a.layout.ty),
+            dest.layout.ty,
+            /*c_variadic*/ false,
+            Safety::Safe,
+            caller_abi,
+        );
+        let caller_fn_abi = this.fn_abi_of_fn_ptr(ty::Binder::dummy(sig), ty::List::empty())?;
 
-        // Initialize remaining locals.
-        this.storage_live_for_always_live_locals()?;
-
-        Ok(())
+        this.init_stack_frame(
+            f,
+            mir,
+            caller_fn_abi,
+            &args.iter().map(|a| FnArg::Copy(a.clone().into())).collect::<Vec<_>>(),
+            /*with_caller_location*/ false,
+            &dest,
+            stack_pop,
+        )
     }
 
     /// Visits the memory covered by `place`, sensitive to freezing: the 2nd parameter
@@ -541,7 +510,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             cur_addr += unsafe_cell_size;
             // Done
-            Ok(())
+            interp_ok(())
         };
         // Run a visitor
         {
@@ -559,7 +528,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     if unsafe_cell_size != Size::ZERO {
                         unsafe_cell_action(&place.ptr(), unsafe_cell_size)
                     } else {
-                        Ok(())
+                        interp_ok(())
                     }
                 },
             };
@@ -567,9 +536,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
         // The part between the end_ptr and the end of the place is also frozen.
         // So pretend there is a 0-sized `UnsafeCell` at the end.
-        unsafe_cell_action(&place.ptr().offset(size, this)?, Size::ZERO)?;
+        unsafe_cell_action(&place.ptr().wrapping_offset(size, this), Size::ZERO)?;
         // Done!
-        return Ok(());
+        return interp_ok(());
 
         /// Visiting the memory covered by a `MemPlace`, being aware of
         /// whether we are inside an `UnsafeCell` or not.
@@ -592,14 +561,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 self.ecx
             }
 
-            fn aggregate_field_order(memory_index: &IndexVec<FieldIdx, u32>, idx: usize) -> usize {
-                // We need to do an *inverse* lookup: find the field that has position `idx` in memory order.
-                for (src_field, &mem_pos) in memory_index.iter_enumerated() {
-                    if mem_pos as usize == idx {
-                        return src_field.as_usize();
-                    }
-                }
-                panic!("invalid `memory_index`, could not find {}-th field in memory order", idx);
+            fn aggregate_field_iter(
+                memory_index: &IndexVec<FieldIdx, u32>,
+            ) -> impl Iterator<Item = FieldIdx> + 'static {
+                let inverse_memory_index = memory_index.invert_bijective_mapping();
+                inverse_memory_index.into_iter()
             }
 
             // Hook to detect `UnsafeCell`.
@@ -615,7 +581,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     (self.unsafe_cell_action)(v)
                 } else if self.ecx.type_is_freeze(v.layout.ty) {
                     // This is `Freeze`, there cannot be an `UnsafeCell`
-                    Ok(())
+                    interp_ok(())
                 } else if matches!(v.layout.fields, FieldsShape::Union(..)) {
                     // A (non-frozen) union. We fall back to whatever the type says.
                     (self.unsafe_cell_action)(v)
@@ -664,7 +630,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         if !self.eval_context_ref().machine.communicate() {
             self.reject_in_isolation(name, RejectOpWith::Abort)?;
         }
-        Ok(())
+        interp_ok(())
     }
 
     /// Helper function used inside the shims of foreign functions which reject the op
@@ -686,13 +652,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         .dcx()
                         .warn(format!("{op_name} was made to return an error due to isolation"));
                 }
-                Ok(())
+                interp_ok(())
             }
             RejectOpWith::Warning => {
                 this.emit_diagnostic(NonHaltingDiagnostic::RejectedIsolatedOp(op_name.to_string()));
-                Ok(())
+                interp_ok(())
             }
-            RejectOpWith::NoWarning => Ok(()), // no warning
+            RejectOpWith::NoWarning => interp_ok(()), // no warning
         }
     }
 
@@ -718,134 +684,21 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         self.eval_context_ref().tcx.sess.target.families.iter().any(|f| f == "unix")
     }
 
-    /// Get last error variable as a place, lazily allocating thread-local storage for it if
-    /// necessary.
-    fn last_error_place(&mut self) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
-        let this = self.eval_context_mut();
-        if let Some(errno_place) = this.active_thread_ref().last_error.as_ref() {
-            Ok(errno_place.clone())
-        } else {
-            // Allocate new place, set initial value to 0.
-            let errno_layout = this.machine.layouts.u32;
-            let errno_place = this.allocate(errno_layout, MiriMemoryKind::Machine.into())?;
-            this.write_scalar(Scalar::from_u32(0), &errno_place)?;
-            this.active_thread_mut().last_error = Some(errno_place.clone());
-            Ok(errno_place)
-        }
-    }
-
-    /// Sets the last error variable.
-    fn set_last_error(&mut self, scalar: Scalar) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        let errno_place = this.last_error_place()?;
-        this.write_scalar(scalar, &errno_place)
-    }
-
-    /// Gets the last error variable.
-    fn get_last_error(&mut self) -> InterpResult<'tcx, Scalar> {
-        let this = self.eval_context_mut();
-        let errno_place = this.last_error_place()?;
-        this.read_scalar(&errno_place)
-    }
-
-    /// This function tries to produce the most similar OS error from the `std::io::ErrorKind`
-    /// as a platform-specific errnum.
-    fn io_error_to_errnum(&self, err: std::io::Error) -> InterpResult<'tcx, Scalar> {
-        let this = self.eval_context_ref();
-        let target = &this.tcx.sess.target;
-        if target.families.iter().any(|f| f == "unix") {
-            for &(name, kind) in UNIX_IO_ERROR_TABLE {
-                if err.kind() == kind {
-                    return Ok(this.eval_libc(name));
-                }
-            }
-            throw_unsup_format!("unsupported io error: {err}")
-        } else if target.families.iter().any(|f| f == "windows") {
-            for &(name, kind) in WINDOWS_IO_ERROR_TABLE {
-                if err.kind() == kind {
-                    return Ok(this.eval_windows("c", name));
-                }
-            }
-            throw_unsup_format!("unsupported io error: {err}");
-        } else {
-            throw_unsup_format!(
-                "converting io::Error into errnum is unsupported for OS {}",
-                target.os
-            )
-        }
-    }
-
-    /// The inverse of `io_error_to_errnum`.
-    #[allow(clippy::needless_return)]
-    fn try_errnum_to_io_error(
-        &self,
-        errnum: Scalar,
-    ) -> InterpResult<'tcx, Option<std::io::ErrorKind>> {
-        let this = self.eval_context_ref();
-        let target = &this.tcx.sess.target;
-        if target.families.iter().any(|f| f == "unix") {
-            let errnum = errnum.to_i32()?;
-            for &(name, kind) in UNIX_IO_ERROR_TABLE {
-                if errnum == this.eval_libc_i32(name) {
-                    return Ok(Some(kind));
-                }
-            }
-            return Ok(None);
-        } else if target.families.iter().any(|f| f == "windows") {
-            let errnum = errnum.to_u32()?;
-            for &(name, kind) in WINDOWS_IO_ERROR_TABLE {
-                if errnum == this.eval_windows("c", name).to_u32()? {
-                    return Ok(Some(kind));
-                }
-            }
-            return Ok(None);
-        } else {
-            throw_unsup_format!(
-                "converting errnum into io::Error is unsupported for OS {}",
-                target.os
-            )
-        }
-    }
-
-    /// Sets the last OS error using a `std::io::ErrorKind`.
-    fn set_last_error_from_io_error(&mut self, err: std::io::Error) -> InterpResult<'tcx> {
-        self.set_last_error(self.io_error_to_errnum(err)?)
-    }
-
-    /// Helper function that consumes an `std::io::Result<T>` and returns an
-    /// `InterpResult<'tcx,T>::Ok` instead. In case the result is an error, this function returns
-    /// `Ok(-1)` and sets the last OS error accordingly.
-    ///
-    /// This function uses `T: From<i32>` instead of `i32` directly because some IO related
-    /// functions return different integer types (like `read`, that returns an `i64`).
-    fn try_unwrap_io_result<T: From<i32>>(
-        &mut self,
-        result: std::io::Result<T>,
-    ) -> InterpResult<'tcx, T> {
-        match result {
-            Ok(ok) => Ok(ok),
-            Err(e) => {
-                self.eval_context_mut().set_last_error_from_io_error(e)?;
-                Ok((-1).into())
-            }
-        }
-    }
-
     /// Dereference a pointer operand to a place using `layout` instead of the pointer's declared type
     fn deref_pointer_as(
         &self,
-        op: &impl Readable<'tcx, Provenance>,
+        op: &impl Projectable<'tcx, Provenance>,
         layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         let this = self.eval_context_ref();
         let ptr = this.read_pointer(op)?;
-        Ok(this.ptr_to_mplace(ptr, layout))
+        interp_ok(this.ptr_to_mplace(ptr, layout))
     }
 
     /// Calculates the MPlaceTy given the offset and layout of an access on an operand
     fn deref_pointer_and_offset(
         &self,
-        op: &impl Readable<'tcx, Provenance>,
+        op: &impl Projectable<'tcx, Provenance>,
         offset: u64,
         base_layout: TyAndLayout<'tcx>,
         value_layout: TyAndLayout<'tcx>,
@@ -857,12 +710,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Ensure that the access is within bounds.
         assert!(base_layout.size >= offset + value_layout.size);
         let value_place = op_place.offset(offset, value_layout, this)?;
-        Ok(value_place)
+        interp_ok(value_place)
     }
 
     fn deref_pointer_and_read(
         &self,
-        op: &impl Readable<'tcx, Provenance>,
+        op: &impl Projectable<'tcx, Provenance>,
         offset: u64,
         base_layout: TyAndLayout<'tcx>,
         value_layout: TyAndLayout<'tcx>,
@@ -874,7 +727,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn deref_pointer_and_write(
         &mut self,
-        op: &impl Readable<'tcx, Provenance>,
+        op: &impl Projectable<'tcx, Provenance>,
         offset: u64,
         value: impl Into<Scalar>,
         base_layout: TyAndLayout<'tcx>,
@@ -897,17 +750,19 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let nanoseconds_scalar = this.read_scalar(&nanoseconds_place)?;
         let nanoseconds = nanoseconds_scalar.to_target_isize(this)?;
 
-        Ok(try {
-            // tv_sec must be non-negative.
-            let seconds: u64 = seconds.try_into().ok()?;
-            // tv_nsec must be non-negative.
-            let nanoseconds: u32 = nanoseconds.try_into().ok()?;
-            if nanoseconds >= 1_000_000_000 {
-                // tv_nsec must not be greater than 999,999,999.
-                None?
-            }
-            Duration::new(seconds, nanoseconds)
-        })
+        interp_ok(
+            try {
+                // tv_sec must be non-negative.
+                let seconds: u64 = seconds.try_into().ok()?;
+                // tv_nsec must be non-negative.
+                let nanoseconds: u32 = nanoseconds.try_into().ok()?;
+                if nanoseconds >= 1_000_000_000 {
+                    // tv_nsec must not be greater than 999,999,999.
+                    None?
+                }
+                Duration::new(seconds, nanoseconds)
+            },
+        )
     }
 
     /// Read bytes from a byte slice.
@@ -920,7 +775,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let ptr = ptr.to_pointer(this)?;
         let len = len.to_target_usize(this)?;
         let bytes = this.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
-        Ok(bytes)
+        interp_ok(bytes)
     }
 
     /// Read a sequence of bytes until the first null terminator.
@@ -936,7 +791,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         loop {
             // FIXME: We are re-getting the allocation each time around the loop.
             // Would be nice if we could somehow "extend" an existing AllocRange.
-            let alloc = this.get_ptr_alloc(ptr.offset(len, this)?, size1)?.unwrap(); // not a ZST, so we will get a result
+            let alloc = this.get_ptr_alloc(ptr.wrapping_offset(len, this), size1)?.unwrap(); // not a ZST, so we will get a result
             let byte = alloc.read_integer(alloc_range(Size::ZERO, size1))?.to_u8()?;
             if byte == 0 {
                 break;
@@ -963,13 +818,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // If `size` is smaller or equal than `bytes.len()`, writing `bytes` plus the required null
         // terminator to memory using the `ptr` pointer would cause an out-of-bounds access.
         let string_length = u64::try_from(c_str.len()).unwrap();
-        let string_length = string_length.checked_add(1).unwrap();
+        let string_length = string_length.strict_add(1);
         if size < string_length {
-            return Ok((false, string_length));
+            return interp_ok((false, string_length));
         }
         self.eval_context_mut()
             .write_bytes_ptr(ptr, c_str.iter().copied().chain(iter::once(0u8)))?;
-        Ok((true, string_length))
+        interp_ok((true, string_length))
     }
 
     /// Helper function to read a sequence of unsigned integers of the given size and alignment
@@ -1000,11 +855,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 break;
             } else {
                 wchars.push(wchar_int.try_into().unwrap());
-                ptr = ptr.offset(size, this)?;
+                ptr = ptr.wrapping_offset(size, this);
             }
         }
 
-        Ok(wchars)
+        interp_ok(wchars)
     }
 
     /// Read a sequence of u16 until the first null terminator.
@@ -1027,9 +882,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // If `size` is smaller or equal than `bytes.len()`, writing `bytes` plus the required
         // 0x0000 terminator to memory would cause an out-of-bounds access.
         let string_length = u64::try_from(wide_str.len()).unwrap();
-        let string_length = string_length.checked_add(1).unwrap();
+        let string_length = string_length.strict_add(1);
         if size < string_length {
-            return Ok((false, string_length));
+            return interp_ok((false, string_length));
         }
 
         // Store the UTF-16 string.
@@ -1041,14 +896,19 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let offset = u64::try_from(offset).unwrap();
             alloc.write_scalar(alloc_range(size2 * offset, size2), Scalar::from_u16(wchar))?;
         }
-        Ok((true, string_length))
+        interp_ok((true, string_length))
     }
 
     /// Read a sequence of wchar_t until the first null terminator.
     /// Always returns a `Vec<u32>` no matter the size of `wchar_t`.
     fn read_wchar_t_str(&self, ptr: Pointer) -> InterpResult<'tcx, Vec<u32>> {
         let this = self.eval_context_ref();
-        let wchar_t = this.libc_ty_layout("wchar_t");
+        let wchar_t = if this.tcx.sess.target.os == "windows" {
+            // We don't have libc on Windows so we have to hard-code the type ourselves.
+            this.machine.layouts.u16
+        } else {
+            this.libc_ty_layout("wchar_t")
+        };
         self.read_c_str_with_char_size(ptr, wchar_t.size, wchar_t.align.abi)
     }
 
@@ -1061,7 +921,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 abi.name()
             )
         }
-        Ok(())
+        interp_ok(())
     }
 
     fn frame_in_std(&self) -> bool {
@@ -1070,12 +930,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Make an attempt to get at the instance of the function this is inlined from.
         let instance: Option<_> = try {
             let scope = frame.current_source_info()?.scope;
-            let inlined_parent = frame.body.source_scopes[scope].inlined_parent_scope?;
-            let source = &frame.body.source_scopes[inlined_parent];
+            let inlined_parent = frame.body().source_scopes[scope].inlined_parent_scope?;
+            let source = &frame.body().source_scopes[inlined_parent];
             source.inlined.expect("inlined_parent_scope points to scope without inline info").0
         };
         // Fall back to the instance of the function itself.
-        let instance = instance.unwrap_or(frame.instance);
+        let instance = instance.unwrap_or(frame.instance());
         // Now check the crate it is in. We could try to be clever here and e.g. check if this is
         // the same crate as `start_fn`, but that would not work for running std tests in Miri, so
         // we'd need some more hacks anyway. So we just check the name of the crate. If someone
@@ -1085,21 +945,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let crate_name = crate_name.as_str();
         // On miri-test-libstd, the name of the crate is different.
         crate_name == "std" || crate_name == "std_miri_test"
-    }
-
-    /// Handler that should be called when an unsupported foreign item is encountered.
-    /// This function will either panic within the context of the emulated application
-    /// or return an error in the Miri process context
-    fn handle_unsupported_foreign_item(&mut self, error_msg: String) -> InterpResult<'tcx, ()> {
-        let this = self.eval_context_mut();
-        if this.machine.panic_on_unsupported {
-            // message is slightly different here to make automated analysis easier
-            let error_msg = format!("unsupported Miri functionality: {error_msg}");
-            this.start_panic(error_msg.as_ref(), mir::UnwindAction::Continue)?;
-            Ok(())
-        } else {
-            throw_machine_stop!(TerminationInfo::UnsupportedForeignItem(error_msg));
-        }
     }
 
     fn check_abi_and_shim_symbol_clash(
@@ -1116,7 +961,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // compiler-builtins when running other crates, but Miri can still be run on
             // compiler-builtins itself (or any crate that uses it as a normal dependency)
             if self.eval_context_ref().tcx.is_compiler_builtins(instance.def_id().krate) {
-                return Ok(());
+                return interp_ok(());
             }
 
             throw_machine_stop!(TerminationInfo::SymbolShimClashing {
@@ -1124,7 +969,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 span: body.span.data(),
             })
         }
-        Ok(())
+        interp_ok(())
     }
 
     fn check_shim<'a, const N: usize>(
@@ -1147,14 +992,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // This got just allocated, so there definitely is a pointer here.
         let provenance = mplace.ptr().into_pointer_or_addr().unwrap().provenance;
         this.alloc_mark_immutable(provenance.get_alloc_id().unwrap()).unwrap();
-    }
-
-    fn item_link_name(&self, def_id: DefId) -> Symbol {
-        let tcx = self.eval_context_ref().tcx;
-        match tcx.get_attrs(def_id, sym::link_name).filter_map(|a| a.value_str()).next() {
-            Some(name) => name,
-            None => tcx.item_name(def_id),
-        }
     }
 
     /// Converts `src` from floating point to integer type `dest_ty`
@@ -1201,12 +1038,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         };
 
         let (val, status) = match fty {
-            FloatTy::F16 => unimplemented!("f16_f128"),
+            FloatTy::F16 =>
+                float_to_int_inner::<Half>(this, src.to_scalar().to_f16()?, cast_to, round),
             FloatTy::F32 =>
                 float_to_int_inner::<Single>(this, src.to_scalar().to_f32()?, cast_to, round),
             FloatTy::F64 =>
                 float_to_int_inner::<Double>(this, src.to_scalar().to_f64()?, cast_to, round),
-            FloatTy::F128 => unimplemented!("f16_f128"),
+            FloatTy::F128 =>
+                float_to_int_inner::<Quad>(this, src.to_scalar().to_f128()?, cast_to, round),
         };
 
         if status.intersects(
@@ -1216,11 +1055,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         ) {
             // Floating point value is NaN (flagged with INVALID_OP) or outside the range
             // of values of the integer type (flagged with OVERFLOW or UNDERFLOW).
-            Ok(None)
+            interp_ok(None)
         } else {
             // Floating point value can be represented by the integer type after rounding.
             // The INEXACT flag is ignored on purpose to allow rounding.
-            Ok(Some(ImmTy::from_scalar(val, cast_to)))
+            interp_ok(Some(ImmTy::from_scalar(val, cast_to)))
         }
     }
 
@@ -1257,7 +1096,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 "attempted to call intrinsic `{intrinsic}` that requires missing target feature {target_feature}"
             );
         }
-        Ok(())
+        interp_ok(())
     }
 
     /// Lookup an array of immediates stored as a linker section of name `name`.
@@ -1270,7 +1109,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         iter_exported_symbols(tcx, |_cnum, def_id| {
             let attrs = tcx.codegen_fn_attrs(def_id);
             let Some(link_section) = attrs.link_section else {
-                return Ok(());
+                return interp_ok(());
             };
             if link_section.as_str() == name {
                 let instance = ty::Instance::mono(tcx, def_id);
@@ -1282,10 +1121,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let val = this.read_immediate(&const_val)?;
                 array.push(val);
             }
-            Ok(())
+            interp_ok(())
         })?;
 
-        Ok(array)
+        interp_ok(array)
     }
 }
 
@@ -1321,9 +1160,9 @@ impl<'tcx> MiriMachine<'tcx> {
 
     /// This is the source of truth for the `is_user_relevant` flag in our `FrameExtra`.
     pub fn is_user_relevant(&self, frame: &Frame<'tcx, Provenance>) -> bool {
-        let def_id = frame.instance.def_id();
+        let def_id = frame.instance().def_id();
         (def_id.is_local() || self.local_crates.contains(&def_id.krate))
-            && !frame.instance.def.requires_caller_location(self.tcx)
+            && !frame.instance().def.requires_caller_location(self.tcx)
     }
 }
 
@@ -1335,9 +1174,24 @@ where
     &'a [OpTy<'tcx>; N]: TryFrom<&'a [OpTy<'tcx>]>,
 {
     if let Ok(ops) = args.try_into() {
-        return Ok(ops);
+        return interp_ok(ops);
     }
     throw_ub_format!("incorrect number of arguments: got {}, expected {}", args.len(), N)
+}
+
+/// Check that the number of args is at least the minumim what we expect.
+pub fn check_min_arg_count<'a, 'tcx, const N: usize>(
+    name: &'a str,
+    args: &'a [OpTy<'tcx>],
+) -> InterpResult<'tcx, &'a [OpTy<'tcx>; N]> {
+    if let Some((ops, _)) = args.split_first_chunk() {
+        return interp_ok(ops);
+    }
+    throw_ub_format!(
+        "incorrect number of arguments for `{name}`: got {}, expected at least {}",
+        args.len(),
+        N
+    )
 }
 
 pub fn isolation_abort_error<'tcx>(name: &str) -> InterpResult<'tcx> {
@@ -1375,7 +1229,7 @@ pub(crate) fn bool_to_simd_element(b: bool, size: Size) -> Scalar {
 
 pub(crate) fn simd_element_to_bool(elem: ImmTy<'_>) -> InterpResult<'_, bool> {
     let val = elem.to_scalar().to_int(elem.layout.size)?;
-    Ok(match val {
+    interp_ok(match val {
         0 => false,
         -1 => true,
         _ => throw_ub_format!("each element of a SIMD mask must be all-0-bits or all-1-bits"),
@@ -1389,7 +1243,7 @@ pub(crate) fn windows_check_buffer_size((success, len): (bool, u64)) -> u32 {
     if success {
         // If the function succeeds, the return value is the number of characters stored in the target buffer,
         // not including the terminating null character.
-        u32::try_from(len.checked_sub(1).unwrap()).unwrap()
+        u32::try_from(len.strict_sub(1)).unwrap()
     } else {
         // If the target buffer was not large enough to hold the data, the return value is the buffer size, in characters,
         // required to hold the string and its terminating null character.

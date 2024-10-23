@@ -40,7 +40,7 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option
             DiagnosticCode::RustcHardError("E0384"),
             format!(
                 "cannot mutate immutable variable `{}`",
-                d.local.name(ctx.sema.db).display(ctx.sema.db)
+                d.local.name(ctx.sema.db).display(ctx.sema.db, ctx.edition)
             ),
             d.span,
         )
@@ -824,13 +824,13 @@ fn f() {
 
     #[test]
     fn or_pattern() {
+        // FIXME: `None` is inferred as unknown here for some reason
         check_diagnostics(
             r#"
 //- minicore: option
 fn f(_: i32) {}
 fn main() {
     let ((Some(mut x), None) | (_, Some(mut x))) = (None, Some(7)) else { return };
-             //^^^^^ 💡 warn: variable does not need to be mutable
     f(x);
 }
 "#,
@@ -1254,6 +1254,31 @@ pub unsafe fn foo(a: *mut A) {
     let mut b = || -> *mut A { &mut *a };
       //^^^^^ 💡 warn: variable does not need to be mutable
     let _ = b();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn regression_15799() {
+        check_diagnostics(
+            r#"
+//- minicore: deref_mut
+struct WrapPtr(*mut u32);
+
+impl core::ops::Deref for WrapPtr {
+    type Target = *mut u32;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+fn main() {
+    let mut x = 0u32;
+    let wrap = WrapPtr(&mut x);
+    unsafe {
+        **wrap = 6;
+    }
 }
 "#,
         );

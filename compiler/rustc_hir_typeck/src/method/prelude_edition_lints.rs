@@ -1,20 +1,21 @@
-use crate::method::probe::{self, Pick};
-use crate::FnCtxt;
+use std::fmt::Write;
 
 use hir::def_id::DefId;
-use hir::HirId;
-use hir::ItemKind;
+use hir::{HirId, ItemKind};
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::{ARRAY_INTO_ITER, BOXED_SLICE_INTO_ITER};
 use rustc_middle::span_bug;
 use rustc_middle::ty::{self, Ty};
-use rustc_session::lint::builtin::RUST_2021_PRELUDE_COLLISIONS;
-use rustc_span::symbol::kw::{Empty, Underscore};
-use rustc_span::symbol::{sym, Ident};
+use rustc_session::lint::builtin::{RUST_2021_PRELUDE_COLLISIONS, RUST_2024_PRELUDE_COLLISIONS};
 use rustc_span::Span;
+use rustc_span::symbol::kw::{Empty, Underscore};
+use rustc_span::symbol::{Ident, sym};
 use rustc_trait_selection::infer::InferCtxtExt;
-use std::fmt::Write;
+use tracing::debug;
+
+use crate::FnCtxt;
+use crate::method::probe::{self, Pick};
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(super) fn lint_edition_dependent_dot_call(
@@ -35,6 +36,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let (prelude_or_array_lint, edition) = match segment.ident.name {
             // `try_into` was added to the prelude in Rust 2021.
             sym::try_into if !span.at_least_rust_2021() => (RUST_2021_PRELUDE_COLLISIONS, "2021"),
+            // `Future::poll` was added to the prelude in Rust 2024.
+            sym::poll
+                // We check that the self type is `Pin<&mut _>` to avoid false positives for this common name.
+                if !span.at_least_rust_2024()
+                    && let ty::Adt(adt_def, args) = self_ty.kind()
+                    && self.tcx.is_lang_item(adt_def.did(), hir::LangItem::Pin)
+                    && let ty::Ref(_, _, ty::Mutability::Mut) =
+                        args[0].as_type().unwrap().kind() =>
+            {
+                (RUST_2024_PRELUDE_COLLISIONS, "2024")
+            }
+            // `IntoFuture::into_future` was added to the prelude in Rust 2024.
+            sym::into_future if !span.at_least_rust_2024() => {
+                (RUST_2024_PRELUDE_COLLISIONS, "2024")
+            }
             // `into_iter` wasn't added to the prelude,
             // but `[T; N].into_iter()` doesn't resolve to IntoIterator::into_iter
             // before Rust 2021, which results in the same problem.
@@ -47,8 +63,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Instead, the problem is that the array-into_iter hack will no longer
                     // apply in Rust 2021.
                     (ARRAY_INTO_ITER, "2021")
-                } else if self_ty.is_box()
-                    && self_ty.boxed_ty().is_slice()
+                } else if self_ty.boxed_ty().is_some_and(Ty::is_slice)
                     && !span.at_least_rust_2024()
                 {
                     // In this case, it wasn't really a prelude addition that was the problem.
@@ -106,16 +121,27 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             mutbl.ref_prefix_str()
                         }
                         Some(probe::AutorefOrPtrAdjustment::ToConstPtr) | None => "",
+                        Some(probe::AutorefOrPtrAdjustment::ReborrowPin(mutbl)) => match mutbl {
+                            hir::Mutability::Mut => "Pin<&mut ",
+                            hir::Mutability::Not => "Pin<&",
+                        },
                     };
                     if let Ok(self_expr) = self.sess().source_map().span_to_snippet(self_expr.span)
                     {
-                        let self_adjusted = if let Some(probe::AutorefOrPtrAdjustment::ToConstPtr) =
+                        let mut self_adjusted =
+                            if let Some(probe::AutorefOrPtrAdjustment::ToConstPtr) =
+                                pick.autoref_or_ptr_adjustment
+                            {
+                                format!("{derefs}{self_expr} as *const _")
+                            } else {
+                                format!("{autoref}{derefs}{self_expr}")
+                            };
+
+                        if let Some(probe::AutorefOrPtrAdjustment::ReborrowPin(_)) =
                             pick.autoref_or_ptr_adjustment
                         {
-                            format!("{derefs}{self_expr} as *const _")
-                        } else {
-                            format!("{autoref}{derefs}{self_expr}")
-                        };
+                            self_adjusted.push('>');
+                        }
 
                         lint.span_suggestion(
                             sp,
@@ -385,6 +411,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let autoref = match pick.autoref_or_ptr_adjustment {
             Some(probe::AutorefOrPtrAdjustment::Autoref { mutbl, .. }) => mutbl.ref_prefix_str(),
             Some(probe::AutorefOrPtrAdjustment::ToConstPtr) | None => "",
+            Some(probe::AutorefOrPtrAdjustment::ReborrowPin(mutbl)) => match mutbl {
+                hir::Mutability::Mut => "Pin<&mut ",
+                hir::Mutability::Not => "Pin<&",
+            },
         };
 
         let (expr_text, precise) = if let Some(expr_text) = expr
@@ -397,13 +427,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ("(..)".to_string(), false)
         };
 
-        let adjusted_text = if let Some(probe::AutorefOrPtrAdjustment::ToConstPtr) =
+        let mut adjusted_text = if let Some(probe::AutorefOrPtrAdjustment::ToConstPtr) =
             pick.autoref_or_ptr_adjustment
         {
             format!("{derefs}{expr_text} as *const _")
         } else {
             format!("{autoref}{derefs}{expr_text}")
         };
+
+        if let Some(probe::AutorefOrPtrAdjustment::ReborrowPin(_)) = pick.autoref_or_ptr_adjustment
+        {
+            adjusted_text.push('>');
+        }
 
         (adjusted_text, precise)
     }

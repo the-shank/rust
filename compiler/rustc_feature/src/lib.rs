@@ -11,9 +11,12 @@
 //! even if it is stabilized or removed, *do not remove it*. Instead, move the
 //! symbol to the `accepted` or `removed` modules respectively.
 
+// tidy-alphabetical-start
 #![allow(internal_features)]
-#![feature(rustdoc_internals)]
 #![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 mod accepted;
 mod builtin_attrs;
@@ -23,12 +26,17 @@ mod unstable;
 #[cfg(test)]
 mod tests;
 
-use rustc_span::symbol::Symbol;
 use std::num::NonZero;
+
+use rustc_span::symbol::Symbol;
 
 #[derive(Debug, Clone)]
 pub struct Feature {
     pub name: Symbol,
+    /// For unstable features: the version the feature was added in.
+    /// For accepted features: the version the feature got stabilized in.
+    /// For removed features we are inconsistent; sometimes this is the
+    /// version it got added, sometimes the version it got removed.
     pub since: &'static str,
     issue: Option<NonZero<u32>>,
 }
@@ -86,13 +94,13 @@ impl UnstableFeatures {
 
 fn find_lang_feature_issue(feature: Symbol) -> Option<NonZero<u32>> {
     // Search in all the feature lists.
-    if let Some(f) = UNSTABLE_FEATURES.iter().find(|f| f.feature.name == feature) {
-        return f.feature.issue;
-    }
-    if let Some(f) = ACCEPTED_FEATURES.iter().find(|f| f.name == feature) {
+    if let Some(f) = UNSTABLE_LANG_FEATURES.iter().find(|f| f.name == feature) {
         return f.issue;
     }
-    if let Some(f) = REMOVED_FEATURES.iter().find(|f| f.feature.name == feature) {
+    if let Some(f) = ACCEPTED_LANG_FEATURES.iter().find(|f| f.name == feature) {
+        return f.issue;
+    }
+    if let Some(f) = REMOVED_LANG_FEATURES.iter().find(|f| f.feature.name == feature) {
         return f.feature.issue;
     }
     panic!("feature `{feature}` is not declared anywhere");
@@ -119,12 +127,12 @@ pub fn find_feature_issue(feature: Symbol, issue: GateIssue) -> Option<NonZero<u
     }
 }
 
-pub use accepted::ACCEPTED_FEATURES;
-pub use builtin_attrs::AttributeDuplicates;
+pub use accepted::ACCEPTED_LANG_FEATURES;
 pub use builtin_attrs::{
-    deprecated_attributes, encode_cross_crate, find_gated_cfg, is_builtin_attr_name,
-    is_unsafe_attr, is_valid_for_get_attr, AttributeGate, AttributeTemplate, AttributeType,
-    BuiltinAttribute, GatedCfg, BUILTIN_ATTRIBUTES, BUILTIN_ATTRIBUTE_MAP,
+    AttributeDuplicates, AttributeGate, AttributeSafety, AttributeTemplate, AttributeType,
+    BUILTIN_ATTRIBUTE_MAP, BUILTIN_ATTRIBUTES, BuiltinAttribute, GatedCfg, deprecated_attributes,
+    encode_cross_crate, find_gated_cfg, is_builtin_attr_name, is_stable_diagnostic_attribute,
+    is_valid_for_get_attr,
 };
-pub use removed::REMOVED_FEATURES;
-pub use unstable::{Features, INCOMPATIBLE_FEATURES, UNSTABLE_FEATURES};
+pub use removed::REMOVED_LANG_FEATURES;
+pub use unstable::{Features, INCOMPATIBLE_FEATURES, UNSTABLE_LANG_FEATURES};

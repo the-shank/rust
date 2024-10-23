@@ -1,7 +1,9 @@
 use rustc_middle::bug;
-use rustc_session::{config::ExpectedValues, Session};
+use rustc_session::Session;
+use rustc_session::config::ExpectedValues;
 use rustc_span::edit_distance::find_best_match_for_name;
-use rustc_span::{sym, Span, Symbol};
+use rustc_span::symbol::Ident;
+use rustc_span::{Span, Symbol, sym};
 
 use crate::lints;
 
@@ -29,7 +31,7 @@ enum EscapeQuotes {
     No,
 }
 
-fn to_check_cfg_arg(name: Symbol, value: Option<Symbol>, quotes: EscapeQuotes) -> String {
+fn to_check_cfg_arg(name: Ident, value: Option<Symbol>, quotes: EscapeQuotes) -> String {
     if let Some(value) = value {
         let value = str::escape_debug(value.as_str()).to_string();
         let values = match quotes {
@@ -109,6 +111,7 @@ pub(super) fn unexpected_cfg_name(
                 }
             };
 
+            let best_match = Ident::new(best_match, name_span);
             if let Some((value, value_span)) = value {
                 if best_match_values.contains(&Some(value)) {
                     lints::unexpected_cfg_name::CodeSuggestion::SimilarNameAndValue {
@@ -162,6 +165,8 @@ pub(super) fn unexpected_cfg_name(
         };
         let expected_names = if !possibilities.is_empty() {
             let (possibilities, and_more) = sort_and_truncate_possibilities(sess, possibilities);
+            let possibilities: Vec<_> =
+                possibilities.into_iter().map(|s| Ident::new(s, name_span)).collect();
             Some(lints::unexpected_cfg_name::ExpectedNames {
                 possibilities: possibilities.into(),
                 and_more,
@@ -175,7 +180,9 @@ pub(super) fn unexpected_cfg_name(
         }
     };
 
-    let inst = |escape_quotes| to_check_cfg_arg(name, value.map(|(v, _s)| v), escape_quotes);
+    let inst = |escape_quotes| {
+        to_check_cfg_arg(Ident::new(name, name_span), value.map(|(v, _s)| v), escape_quotes)
+    };
 
     let invocation_help = if is_from_cargo {
         let sub = if !is_feature_cfg { Some(cargo_help_sub(sess, &inst)) } else { None };
@@ -261,12 +268,20 @@ pub(super) fn unexpected_cfg_value(
         lints::unexpected_cfg_value::CodeSuggestion::RemoveCondition { suggestion, name }
     };
 
-    // We don't want to suggest adding values to well known names
-    // since those are defined by rustc it-self. Users can still
-    // do it if they want, but should not encourage them.
-    let is_cfg_a_well_know_name = sess.psess.check_config.well_known_names.contains(&name);
+    // We don't want to encourage people to add values to a well-known names, as these are
+    // defined by rustc/Rust itself. Users can still do this if they wish, but should not be
+    // encouraged to do so.
+    let can_suggest_adding_value = !sess.psess.check_config.well_known_names.contains(&name)
+        // Except when working on rustc or the standard library itself, in which case we want to
+        // suggest adding these cfgs to the "normal" place because of bootstrapping reasons. As a
+        // basic heuristic, we use the "cheat" unstable feature enable method and the
+        // non-ui-testing enabled option.
+        || (matches!(sess.psess.unstable_features, rustc_feature::UnstableFeatures::Cheat)
+            && !sess.opts.unstable_opts.ui_testing);
 
-    let inst = |escape_quotes| to_check_cfg_arg(name, value.map(|(v, _s)| v), escape_quotes);
+    let inst = |escape_quotes| {
+        to_check_cfg_arg(Ident::new(name, name_span), value.map(|(v, _s)| v), escape_quotes)
+    };
 
     let invocation_help = if is_from_cargo {
         let help = if name == sym::feature {
@@ -275,14 +290,14 @@ pub(super) fn unexpected_cfg_value(
             } else {
                 Some(lints::unexpected_cfg_value::CargoHelp::DefineFeatures)
             }
-        } else if !is_cfg_a_well_know_name {
+        } else if can_suggest_adding_value {
             Some(lints::unexpected_cfg_value::CargoHelp::Other(cargo_help_sub(sess, &inst)))
         } else {
             None
         };
         lints::unexpected_cfg_value::InvocationHelp::Cargo(help)
     } else {
-        let help = if !is_cfg_a_well_know_name {
+        let help = if can_suggest_adding_value {
             Some(lints::UnexpectedCfgRustcHelp::new(&inst(EscapeQuotes::No)))
         } else {
             None

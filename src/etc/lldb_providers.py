@@ -389,11 +389,11 @@ class StdVecSyntheticProvider:
     def update(self):
         # type: () -> None
         self.length = self.valobj.GetChildMemberWithName("len").GetValueAsUnsigned()
-        self.buf = self.valobj.GetChildMemberWithName("buf")
+        self.buf = self.valobj.GetChildMemberWithName("buf").GetChildMemberWithName("inner")
 
         self.data_ptr = unwrap_unique_or_non_null(self.buf.GetChildMemberWithName("ptr"))
 
-        self.element_type = self.data_ptr.GetType().GetPointeeType()
+        self.element_type = self.valobj.GetType().GetTemplateArgumentType(0)
         self.element_type_size = self.element_type.GetByteSize()
 
     def has_children(self):
@@ -474,7 +474,7 @@ class StdVecDequeSyntheticProvider:
         # type: () -> None
         self.head = self.valobj.GetChildMemberWithName("head").GetValueAsUnsigned()
         self.size = self.valobj.GetChildMemberWithName("len").GetValueAsUnsigned()
-        self.buf = self.valobj.GetChildMemberWithName("buf")
+        self.buf = self.valobj.GetChildMemberWithName("buf").GetChildMemberWithName("inner")
         cap = self.buf.GetChildMemberWithName("cap")
         if cap.GetType().num_fields == 1:
             cap = cap.GetChildAtIndex(0)
@@ -482,7 +482,7 @@ class StdVecDequeSyntheticProvider:
 
         self.data_ptr = unwrap_unique_or_non_null(self.buf.GetChildMemberWithName("ptr"))
 
-        self.element_type = self.data_ptr.GetType().GetPointeeType()
+        self.element_type = self.valobj.GetType().GetTemplateArgumentType(0)
         self.element_type_size = self.element_type.GetByteSize()
 
     def has_children(self):
@@ -670,11 +670,11 @@ def StdRcSummaryProvider(valobj, dict):
 class StdRcSyntheticProvider:
     """Pretty-printer for alloc::rc::Rc<T> and alloc::sync::Arc<T>
 
-    struct Rc<T> { ptr: NonNull<RcBox<T>>, ... }
+    struct Rc<T> { ptr: NonNull<RcInner<T>>, ... }
     rust 1.31.1: struct NonNull<T> { pointer: NonZero<*const T> }
     rust 1.33.0: struct NonNull<T> { pointer: *const T }
     struct NonZero<T>(T)
-    struct RcBox<T> { strong: Cell<usize>, weak: Cell<usize>, value: T }
+    struct RcInner<T> { strong: Cell<usize>, weak: Cell<usize>, value: T }
     struct Cell<T> { value: UnsafeCell<T> }
     struct UnsafeCell<T> { value: T }
 

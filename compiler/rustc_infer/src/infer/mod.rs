@@ -1,69 +1,81 @@
-pub use at::DefineOpaqueTypes;
-pub use freshen::TypeFreshener;
-pub use lexical_region_resolve::RegionResolutionError;
-pub use rustc_macros::{TypeFoldable, TypeVisitable};
-pub use rustc_middle::ty::IntVarValue;
+use std::cell::{Cell, RefCell};
+use std::fmt;
+
 pub use BoundRegionConversionTime::*;
 pub use RegionVariableOrigin::*;
 pub use SubregionOrigin::*;
-pub use ValuePairs::*;
+pub use at::DefineOpaqueTypes;
+use free_regions::RegionRelations;
+pub use freshen::TypeFreshener;
+use lexical_region_resolve::LexicalRegionResolutions;
+pub use lexical_region_resolve::RegionResolutionError;
+use opaque_types::OpaqueTypeStorage;
+use region_constraints::{
+    GenericKind, RegionConstraintCollector, RegionConstraintStorage, VarInfos, VerifyBound,
+};
+pub use relate::StructurallyRelateAliases;
+pub use relate::combine::PredicateEmittingRelation;
+use rustc_data_structures::captures::Captures;
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
+use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::undo_log::{Rollback, UndoLogs};
+use rustc_data_structures::unify as ut;
+use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
+use rustc_hir as hir;
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_macros::extension;
+pub use rustc_macros::{TypeFoldable, TypeVisitable};
+use rustc_middle::infer::canonical::{CanonicalQueryInput, CanonicalVarValues};
+use rustc_middle::infer::unify_key::{
+    ConstVariableOrigin, ConstVariableValue, ConstVidKey, EffectVarValue, EffectVidKey,
+};
+use rustc_middle::mir::ConstraintCategory;
+use rustc_middle::mir::interpret::{ErrorHandled, EvalToValTreeResult};
+use rustc_middle::traits::select;
+pub use rustc_middle::ty::IntVarValue;
+use rustc_middle::ty::error::{ExpectedFound, TypeError};
+use rustc_middle::ty::fold::{
+    BoundVarReplacerDelegate, TypeFoldable, TypeFolder, TypeSuperFoldable,
+};
+use rustc_middle::ty::visit::TypeVisitableExt;
+use rustc_middle::ty::{
+    self, ConstVid, EffectVid, FloatVid, GenericArg, GenericArgKind, GenericArgs, GenericArgsRef,
+    GenericParamDefKind, InferConst, IntVid, Ty, TyCtxt, TyVid,
+};
+use rustc_middle::{bug, span_bug};
+use rustc_span::Span;
+use rustc_span::symbol::Symbol;
+use snapshot::undo_log::InferCtxtUndoLogs;
+use tracing::{debug, instrument};
+use type_variable::TypeVariableOrigin;
 
-use crate::infer::relate::{CombineFields, RelateResult};
+use crate::infer::region_constraints::UndoLog;
 use crate::traits::{
     self, ObligationCause, ObligationInspector, PredicateObligations, TraitEngine,
 };
-use error_reporting::TypeErrCtxt;
-use free_regions::RegionRelations;
-use lexical_region_resolve::LexicalRegionResolutions;
-use opaque_types::OpaqueTypeStorage;
-use region_constraints::{GenericKind, VarInfos, VerifyBound};
-use region_constraints::{RegionConstraintCollector, RegionConstraintStorage};
-use rustc_data_structures::captures::Captures;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
-use rustc_data_structures::sync::Lrc;
-use rustc_data_structures::undo_log::Rollback;
-use rustc_data_structures::unify as ut;
-use rustc_errors::{Diag, DiagCtxt, ErrorGuaranteed};
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_macros::extension;
-use rustc_middle::infer::canonical::{Canonical, CanonicalVarValues};
-use rustc_middle::infer::unify_key::ConstVariableOrigin;
-use rustc_middle::infer::unify_key::ConstVariableValue;
-use rustc_middle::infer::unify_key::EffectVarValue;
-use rustc_middle::infer::unify_key::{ConstVidKey, EffectVidKey};
-use rustc_middle::mir::interpret::{ErrorHandled, EvalToValTreeResult};
-use rustc_middle::mir::ConstraintCategory;
-use rustc_middle::traits::select;
-use rustc_middle::ty::error::{ExpectedFound, TypeError};
-use rustc_middle::ty::fold::BoundVarReplacerDelegate;
-use rustc_middle::ty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable};
-use rustc_middle::ty::visit::TypeVisitableExt;
-use rustc_middle::ty::{self, GenericParamDefKind, InferConst, Ty, TyCtxt};
-use rustc_middle::ty::{ConstVid, EffectVid, FloatVid, IntVid, TyVid};
-use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgs, GenericArgsRef};
-use rustc_middle::{bug, span_bug};
-use rustc_span::symbol::Symbol;
-use rustc_span::Span;
-use snapshot::undo_log::InferCtxtUndoLogs;
-use std::cell::{Cell, RefCell};
-use std::fmt;
-use type_variable::TypeVariableOrigin;
 
 pub mod at;
 pub mod canonical;
-pub mod error_reporting;
-pub mod free_regions;
+mod context;
+mod free_regions;
 mod freshen;
 mod lexical_region_resolve;
-pub mod opaque_types;
+mod opaque_types;
 pub mod outlives;
 mod projection;
 pub mod region_constraints;
 pub mod relate;
 pub mod resolve;
 pub(crate) mod snapshot;
-pub mod type_variable;
+mod type_variable;
 
+/// `InferOk<'tcx, ()>` is used a lot. It may seem like a useless wrapper
+/// around `PredicateObligations<'tcx>`, but it has one important property:
+/// because `InferOk` is marked with `#[must_use]`, if you have a method
+/// `InferCtxt::f` that returns `InferResult<'tcx, ()>` and you call it with
+/// `infcx.f()?;` you'll get a warning about the obligations being discarded
+/// without use, which is probably unintentional and has been a source of bugs
+/// in the past.
 #[must_use]
 #[derive(Debug)]
 pub struct InferOk<'tcx, T> {
@@ -72,8 +84,7 @@ pub struct InferOk<'tcx, T> {
 }
 pub type InferResult<'tcx, T> = Result<InferOk<'tcx, T>, TypeError<'tcx>>;
 
-pub type UnitResult<'tcx> = RelateResult<'tcx, ()>; // "unify result"
-pub type FixupResult<T> = Result<T, FixupError>; // "fixup result"
+pub(crate) type FixupResult<T> = Result<T, FixupError>; // "fixup result"
 
 pub(crate) type UnificationTable<'a, 'tcx, T> = ut::UnificationTable<
     ut::InPlace<T, &'a mut ut::UnificationStorage<T>, &'a mut InferCtxtUndoLogs<'tcx>>,
@@ -161,12 +172,12 @@ impl<'tcx> InferCtxtInner<'tcx> {
             undo_log: InferCtxtUndoLogs::default(),
 
             projection_cache: Default::default(),
-            type_variable_storage: type_variable::TypeVariableStorage::new(),
-            const_unification_storage: ut::UnificationTableStorage::new(),
-            int_unification_storage: ut::UnificationTableStorage::new(),
-            float_unification_storage: ut::UnificationTableStorage::new(),
-            effect_unification_storage: ut::UnificationTableStorage::new(),
-            region_constraint_storage: Some(RegionConstraintStorage::new()),
+            type_variable_storage: Default::default(),
+            const_unification_storage: Default::default(),
+            int_unification_storage: Default::default(),
+            float_unification_storage: Default::default(),
+            effect_unification_storage: Default::default(),
+            region_constraint_storage: Some(Default::default()),
             region_obligations: vec![],
             opaque_type_storage: Default::default(),
         }
@@ -198,7 +209,7 @@ impl<'tcx> InferCtxtInner<'tcx> {
     }
 
     #[inline]
-    pub fn opaque_types(&mut self) -> opaque_types::OpaqueTypeTable<'_, 'tcx> {
+    fn opaque_types(&mut self) -> opaque_types::OpaqueTypeTable<'_, 'tcx> {
         self.opaque_type_storage.with_log(&mut self.undo_log)
     }
 
@@ -276,26 +287,13 @@ pub struct InferCtxt<'tcx> {
     pub reported_signature_mismatch: RefCell<FxHashSet<(Span, Option<Span>)>>,
 
     /// When an error occurs, we want to avoid reporting "derived"
-    /// errors that are due to this original failure. Normally, we
-    /// handle this with the `err_count_on_creation` count, which
-    /// basically just tracks how many errors were reported when we
-    /// started type-checking a fn and checks to see if any new errors
-    /// have been reported since then. Not great, but it works.
-    ///
-    /// However, when errors originated in other passes -- notably
-    /// resolve -- this heuristic breaks down. Therefore, we have this
-    /// auxiliary flag that one can set whenever one creates a
-    /// type-error that is due to an error in a prior pass.
+    /// errors that are due to this original failure. We have this
+    /// flag that one can set whenever one creates a type-error that
+    /// is due to an error in a prior pass.
     ///
     /// Don't read this flag directly, call `is_tainted_by_errors()`
     /// and `set_tainted_by_errors()`.
     tainted_by_errors: Cell<Option<ErrorGuaranteed>>,
-
-    /// Track how many errors were reported when this infcx is created.
-    /// If the number of errors increases, that's also a sign (like
-    /// `tainted_by_errors`) to avoid reporting certain kinds of errors.
-    // FIXME(matthewjasper) Merge into `tainted_by_errors`
-    err_count_on_creation: usize,
 
     /// What is the innermost universe we have created? Starts out as
     /// `UniverseIndex::root()` but grows from there as we enter
@@ -331,79 +329,6 @@ pub struct InferCtxt<'tcx> {
     next_trait_solver: bool,
 
     pub obligation_inspector: Cell<Option<ObligationInspector<'tcx>>>,
-}
-
-impl<'tcx> ty::InferCtxtLike for InferCtxt<'tcx> {
-    type Interner = TyCtxt<'tcx>;
-
-    fn interner(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
-    fn universe_of_ty(&self, vid: TyVid) -> Option<ty::UniverseIndex> {
-        // FIXME(BoxyUwU): this is kind of jank and means that printing unresolved
-        // ty infers will give you the universe of the var it resolved to not the universe
-        // it actually had. It also means that if you have a `?0.1` and infer it to `u8` then
-        // try to print out `?0.1` it will just print `?0`.
-        match self.probe_ty_var(vid) {
-            Err(universe) => Some(universe),
-            Ok(_) => None,
-        }
-    }
-
-    fn universe_of_ct(&self, ct: ConstVid) -> Option<ty::UniverseIndex> {
-        // Same issue as with `universe_of_ty`
-        match self.probe_const_var(ct) {
-            Err(universe) => Some(universe),
-            Ok(_) => None,
-        }
-    }
-
-    fn universe_of_lt(&self, lt: ty::RegionVid) -> Option<ty::UniverseIndex> {
-        match self.inner.borrow_mut().unwrap_region_constraints().probe_value(lt) {
-            Err(universe) => Some(universe),
-            Ok(_) => None,
-        }
-    }
-
-    fn opportunistic_resolve_lt_var(&self, vid: ty::RegionVid) -> ty::Region<'tcx> {
-        self.inner.borrow_mut().unwrap_region_constraints().opportunistic_resolve_var(self.tcx, vid)
-    }
-
-    fn defining_opaque_types(&self) -> &'tcx ty::List<LocalDefId> {
-        self.defining_opaque_types
-    }
-
-    fn opportunistic_resolve_ty_var(&self, vid: TyVid) -> Ty<'tcx> {
-        match self.probe_ty_var(vid) {
-            Ok(ty) => ty,
-            Err(_) => Ty::new_var(self.tcx, self.root_var(vid)),
-        }
-    }
-
-    fn opportunistic_resolve_int_var(&self, vid: IntVid) -> Ty<'tcx> {
-        self.opportunistic_resolve_int_var(vid)
-    }
-
-    fn opportunistic_resolve_float_var(&self, vid: FloatVid) -> Ty<'tcx> {
-        self.opportunistic_resolve_float_var(vid)
-    }
-
-    fn opportunistic_resolve_ct_var(&self, vid: ConstVid) -> ty::Const<'tcx> {
-        match self.probe_const_var(vid) {
-            Ok(ct) => ct,
-            Err(_) => ty::Const::new_var(self.tcx, self.root_const_var(vid)),
-        }
-    }
-
-    fn opportunistic_resolve_effect_var(&self, vid: EffectVid) -> ty::Const<'tcx> {
-        match self.probe_effect_var(vid) {
-            Some(ct) => ct,
-            None => {
-                ty::Const::new_infer(self.tcx, InferConst::EffectVar(self.root_effect_var(vid)))
-            }
-        }
-    }
 }
 
 /// See the `error_reporting` module for more details.
@@ -459,7 +384,7 @@ pub enum SubregionOrigin<'tcx> {
 
     /// The given region parameter was instantiated with a region
     /// that must outlive some other region.
-    RelateRegionParamBound(Span),
+    RelateRegionParamBound(Span, Option<Ty<'tcx>>),
 
     /// Creating a pointer `b` to contents of another reference.
     Reborrow(Span),
@@ -526,8 +451,8 @@ pub enum RegionVariableOrigin {
     PatternRegion(Span),
 
     /// Regions created by `&` operator.
-    ///
-    AddrOfRegion(Span),
+    BorrowRegion(Span),
+
     /// Regions created as part of an autoref of a method receiver.
     Autoref(Span),
 
@@ -577,14 +502,31 @@ pub enum NllRegionVariableOrigin {
     },
 }
 
-// FIXME(eddyb) investigate overlap between this and `TyOrConstInferVar`.
 #[derive(Copy, Clone, Debug)]
-pub enum FixupError {
-    UnresolvedIntTy(IntVid),
-    UnresolvedFloatTy(FloatVid),
-    UnresolvedTy(TyVid),
-    UnresolvedConst(ConstVid),
-    UnresolvedEffect(EffectVid),
+pub struct FixupError {
+    unresolved: TyOrConstInferVar,
+}
+
+impl fmt::Display for FixupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use TyOrConstInferVar::*;
+
+        match self.unresolved {
+            TyInt(_) => write!(
+                f,
+                "cannot determine the type of this integer; \
+                 add a suffix to specify the type explicitly"
+            ),
+            TyFloat(_) => write!(
+                f,
+                "cannot determine the type of this number; \
+                 add a suffix to specify the type explicitly"
+            ),
+            Ty(_) => write!(f, "unconstrained type"),
+            Const(_) => write!(f, "unconstrained const value"),
+            Effect(_) => write!(f, "unconstrained effect value"),
+        }
+    }
 }
 
 /// See the `region_obligations` field for more information.
@@ -593,28 +535,6 @@ pub struct RegionObligation<'tcx> {
     pub sub_region: ty::Region<'tcx>,
     pub sup_type: Ty<'tcx>,
     pub origin: SubregionOrigin<'tcx>,
-}
-
-impl fmt::Display for FixupError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use self::FixupError::*;
-
-        match *self {
-            UnresolvedIntTy(_) => write!(
-                f,
-                "cannot determine the type of this integer; \
-                 add a suffix to specify the type explicitly"
-            ),
-            UnresolvedFloatTy(_) => write!(
-                f,
-                "cannot determine the type of this number; \
-                 add a suffix to specify the type explicitly"
-            ),
-            UnresolvedTy(_) => write!(f, "unconstrained type"),
-            UnresolvedConst(_) => write!(f, "unconstrained const value"),
-            UnresolvedEffect(_) => write!(f, "unconstrained effect value"),
-        }
-    }
 }
 
 /// Used to configure inference contexts before their creation.
@@ -656,14 +576,6 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
         self
     }
 
-    pub fn with_defining_opaque_types(
-        mut self,
-        defining_opaque_types: &'tcx ty::List<LocalDefId>,
-    ) -> Self {
-        self.defining_opaque_types = defining_opaque_types;
-        self
-    }
-
     pub fn with_next_trait_solver(mut self, next_trait_solver: bool) -> Self {
         self.next_trait_solver = next_trait_solver;
         self
@@ -692,15 +604,16 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     /// the bound values in `C` to their instantiated values in `V`
     /// (in other words, `S(C) = V`).
     pub fn build_with_canonical<T>(
-        self,
+        mut self,
         span: Span,
-        canonical: &Canonical<'tcx, T>,
+        input: &CanonicalQueryInput<'tcx, T>,
     ) -> (InferCtxt<'tcx>, T, CanonicalVarValues<'tcx>)
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let infcx = self.with_defining_opaque_types(canonical.defining_opaque_types).build();
-        let (value, args) = infcx.instantiate_canonical(span, canonical);
+        self.defining_opaque_types = input.defining_opaque_types;
+        let infcx = self.build();
+        let (value, args) = infcx.instantiate_canonical(span, &input.canonical);
         (infcx, value, args)
     }
 
@@ -725,7 +638,6 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
             reported_trait_errors: Default::default(),
             reported_signature_mismatch: Default::default(),
             tainted_by_errors: Cell::new(None),
-            err_count_on_creation: tcx.dcx().err_count_excluding_lint_errs(),
             universe: Cell::new(ty::UniverseIndex::ROOT),
             intercrate,
             next_trait_solver,
@@ -754,44 +666,36 @@ impl<'tcx> InferOk<'tcx, ()> {
 }
 
 impl<'tcx> InferCtxt<'tcx> {
-    pub fn dcx(&self) -> &'tcx DiagCtxt {
-        self.tcx.dcx()
+    pub fn dcx(&self) -> DiagCtxtHandle<'_> {
+        self.tcx.dcx().taintable_handle(&self.tainted_by_errors)
+    }
+
+    pub fn defining_opaque_types(&self) -> &'tcx ty::List<LocalDefId> {
+        self.defining_opaque_types
     }
 
     pub fn next_trait_solver(&self) -> bool {
         self.next_trait_solver
     }
 
-    /// Creates a `TypeErrCtxt` for emitting various inference errors.
-    /// During typeck, use `FnCtxt::err_ctxt` instead.
-    pub fn err_ctxt(&self) -> TypeErrCtxt<'_, 'tcx> {
-        TypeErrCtxt {
-            infcx: self,
-            sub_relations: Default::default(),
-            typeck_results: None,
-            fallback_has_occurred: false,
-            normalize_fn_sig: Box::new(|fn_sig| fn_sig),
-            autoderef_steps: Box::new(|ty| {
-                debug_assert!(false, "shouldn't be using autoderef_steps outside of typeck");
-                vec![(ty, vec![])]
-            }),
-        }
-    }
-
     pub fn freshen<T: TypeFoldable<TyCtxt<'tcx>>>(&self, t: T) -> T {
         t.fold_with(&mut self.freshener())
     }
 
-    /// Returns the origin of the type variable identified by `vid`, or `None`
-    /// if this is not a type variable.
+    /// Returns the origin of the type variable identified by `vid`.
     ///
-    /// No attempt is made to resolve `ty`.
-    pub fn type_var_origin(&self, ty: Ty<'tcx>) -> Option<TypeVariableOrigin> {
-        match *ty.kind() {
-            ty::Infer(ty::TyVar(vid)) => {
-                Some(self.inner.borrow_mut().type_variables().var_origin(vid))
-            }
-            _ => None,
+    /// No attempt is made to resolve `vid` to its root variable.
+    pub fn type_var_origin(&self, vid: TyVid) -> TypeVariableOrigin {
+        self.inner.borrow_mut().type_variables().var_origin(vid)
+    }
+
+    /// Returns the origin of the const variable identified by `vid`
+    // FIXME: We should store origins separately from the unification table
+    // so this doesn't need to be optional.
+    pub fn const_var_origin(&self, vid: ConstVid) -> Option<ConstVariableOrigin> {
+        match self.inner.borrow_mut().const_unification_table().probe_value(vid) {
+            ConstVariableValue::Known { .. } => None,
+            ConstVariableValue::Unknown { origin, .. } => Some(origin),
         }
     }
 
@@ -809,13 +713,13 @@ impl<'tcx> InferCtxt<'tcx> {
             .collect();
         vars.extend(
             (0..inner.int_unification_table().len())
-                .map(|i| ty::IntVid::from_u32(i as u32))
+                .map(|i| ty::IntVid::from_usize(i))
                 .filter(|&vid| inner.int_unification_table().probe_value(vid).is_unknown())
                 .map(|v| Ty::new_int_var(self.tcx, v)),
         );
         vars.extend(
             (0..inner.float_unification_table().len())
-                .map(|i| ty::FloatVid::from_u32(i as u32))
+                .map(|i| ty::FloatVid::from_usize(i))
                 .filter(|&vid| inner.float_unification_table().probe_value(vid).is_unknown())
                 .map(|v| Ty::new_float_var(self.tcx, v)),
         );
@@ -831,28 +735,6 @@ impl<'tcx> InferCtxt<'tcx> {
             .filter(|&vid| table.probe_value(vid).is_unknown())
             .map(|v| ty::Const::new_infer(self.tcx, ty::InferConst::EffectVar(v)))
             .collect()
-    }
-
-    pub fn can_sub<T>(&self, param_env: ty::ParamEnv<'tcx>, expected: T, actual: T) -> bool
-    where
-        T: at::ToTrace<'tcx>,
-    {
-        let origin = &ObligationCause::dummy();
-        self.probe(|_| {
-            // We're only answering whether there could be a subtyping relation, and with
-            // opaque types, "there could be one", via registering a hidden type.
-            self.at(origin, param_env).sub(DefineOpaqueTypes::Yes, expected, actual).is_ok()
-        })
-    }
-
-    pub fn can_eq<T>(&self, param_env: ty::ParamEnv<'tcx>, a: T, b: T) -> bool
-    where
-        T: at::ToTrace<'tcx>,
-    {
-        let origin = &ObligationCause::dummy();
-        // We're only answering whether the types could be the same, and with
-        // opaque types, "they can be the same", via registering a hidden type.
-        self.probe(|_| self.at(origin, param_env).eq(DefineOpaqueTypes::Yes, a, b).is_ok())
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -874,7 +756,7 @@ impl<'tcx> InferCtxt<'tcx> {
         definition_span: Span,
         hidden_ty: Ty<'tcx>,
         region: ty::Region<'tcx>,
-        in_regions: &Lrc<Vec<ty::Region<'tcx>>>,
+        in_regions: Lrc<Vec<ty::Region<'tcx>>>,
     ) {
         self.inner.borrow_mut().unwrap_region_constraints().member_constraint(
             key,
@@ -944,9 +826,9 @@ impl<'tcx> InferCtxt<'tcx> {
 
         self.enter_forall(predicate, |ty::SubtypePredicate { a_is_expected, a, b }| {
             if a_is_expected {
-                Ok(self.at(cause, param_env).sub(DefineOpaqueTypes::No, a, b))
+                Ok(self.at(cause, param_env).sub(DefineOpaqueTypes::Yes, a, b))
             } else {
-                Ok(self.at(cause, param_env).sup(DefineOpaqueTypes::No, b, a))
+                Ok(self.at(cause, param_env).sup(DefineOpaqueTypes::Yes, b, a))
             }
         })
     }
@@ -958,7 +840,7 @@ impl<'tcx> InferCtxt<'tcx> {
     ) {
         self.enter_forall(predicate, |ty::OutlivesPredicate(r_a, r_b)| {
             let origin = SubregionOrigin::from_obligation_cause(cause, || {
-                RelateRegionParamBound(cause.span)
+                RelateRegionParamBound(cause.span, None)
             });
             self.sub_regions(origin, r_b, r_a); // `b : a` ==> `a <= b`
         })
@@ -1017,28 +899,23 @@ impl<'tcx> InferCtxt<'tcx> {
         ty::Const::new_var(self.tcx, vid)
     }
 
-    pub fn next_const_var_id(&self, origin: ConstVariableOrigin) -> ConstVid {
-        self.inner
-            .borrow_mut()
-            .const_unification_table()
-            .new_key(ConstVariableValue::Unknown { origin, universe: self.universe() })
-            .vid
-    }
+    fn next_effect_var(&self) -> ty::Const<'tcx> {
+        let effect_vid =
+            self.inner.borrow_mut().effect_unification_table().new_key(EffectVarValue::Unknown).vid;
 
-    fn next_int_var_id(&self) -> IntVid {
-        self.inner.borrow_mut().int_unification_table().new_key(ty::IntVarValue::Unknown)
+        ty::Const::new_infer(self.tcx, ty::InferConst::EffectVar(effect_vid))
     }
 
     pub fn next_int_var(&self) -> Ty<'tcx> {
-        Ty::new_int_var(self.tcx, self.next_int_var_id())
-    }
-
-    fn next_float_var_id(&self) -> FloatVid {
-        self.inner.borrow_mut().float_unification_table().new_key(ty::FloatVarValue::Unknown)
+        let next_int_var_id =
+            self.inner.borrow_mut().int_unification_table().new_key(ty::IntVarValue::Unknown);
+        Ty::new_int_var(self.tcx, next_int_var_id)
     }
 
     pub fn next_float_var(&self) -> Ty<'tcx> {
-        Ty::new_float_var(self.tcx, self.next_float_var_id())
+        let next_float_var_id =
+            self.inner.borrow_mut().float_unification_table().new_key(ty::FloatVarValue::Unknown);
+        Ty::new_float_var(self.tcx, next_float_var_id)
     }
 
     /// Creates a fresh region variable with the next available index.
@@ -1131,19 +1008,17 @@ impl<'tcx> InferCtxt<'tcx> {
     }
 
     pub fn var_for_effect(&self, param: &ty::GenericParamDef) -> GenericArg<'tcx> {
-        let effect_vid =
-            self.inner.borrow_mut().effect_unification_table().new_key(EffectVarValue::Unknown).vid;
         let ty = self
             .tcx
             .type_of(param.def_id)
             .no_bound_vars()
             .expect("const parameter types cannot be generic");
         debug_assert_eq!(self.tcx.types.bool, ty);
-        ty::Const::new_infer(self.tcx, ty::InferConst::EffectVar(effect_vid)).into()
+        self.next_effect_var().into()
     }
 
-    /// Given a set of generics defined on a type or impl, returns the generic parameters mapping each
-    /// type/region parameter to a fresh inference variable.
+    /// Given a set of generics defined on a type or impl, returns the generic parameters mapping
+    /// each type/region parameter to a fresh inference variable.
     pub fn fresh_args_for_item(&self, span: Span, def_id: DefId) -> GenericArgsRef<'tcx> {
         GenericArgs::for_item(self.tcx, def_id, |param, _| self.var_for_def(span, param))
     }
@@ -1155,19 +1030,7 @@ impl<'tcx> InferCtxt<'tcx> {
     /// inference variables, regionck errors).
     #[must_use = "this method does not have any side effects"]
     pub fn tainted_by_errors(&self) -> Option<ErrorGuaranteed> {
-        if let Some(guar) = self.tainted_by_errors.get() {
-            Some(guar)
-        } else if self.dcx().err_count_excluding_lint_errs() > self.err_count_on_creation {
-            // Errors reported since this infcx was made. Lint errors are
-            // excluded to avoid some being swallowed in the presence of
-            // non-lint errors. (It's arguable whether or not this exclusion is
-            // important.)
-            let guar = self.dcx().has_errors().unwrap();
-            self.set_tainted_by_errors(guar);
-            Some(guar)
-        } else {
-            None
-        }
+        self.tainted_by_errors.get()
     }
 
     /// Set the "tainted by errors" flag to true. We call this when we
@@ -1186,18 +1049,14 @@ impl<'tcx> InferCtxt<'tcx> {
     /// Clone the list of variable regions. This is used only during NLL processing
     /// to put the set of region variables into the NLL region context.
     pub fn get_region_var_origins(&self) -> VarInfos {
-        let mut inner = self.inner.borrow_mut();
-        let (var_infos, data) = inner
-            .region_constraint_storage
-            // We clone instead of taking because borrowck still wants to use
-            // the inference context after calling this for diagnostics
-            // and the new trait solver.
-            .clone()
-            .expect("regions already resolved")
-            .with_log(&mut inner.undo_log)
-            .into_infos_and_data();
-        assert!(data.is_empty());
-        var_infos
+        let inner = self.inner.borrow();
+        assert!(!UndoLogs::<UndoLog<'_>>::in_snapshot(&inner.undo_log));
+        let storage = inner.region_constraint_storage.as_ref().expect("regions already resolved");
+        assert!(storage.data.is_empty());
+        // We clone instead of taking because borrowck still wants to use the
+        // inference context after calling this for diagnostics and the new
+        // trait solver.
+        storage.var_infos.clone()
     }
 
     #[instrument(level = "debug", skip(self), ret)]
@@ -1351,6 +1210,9 @@ impl<'tcx> InferCtxt<'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
+        if let Err(guar) = value.error_reported() {
+            self.set_tainted_by_errors(guar);
+        }
         if !value.has_non_region_infer() {
             return value;
         }
@@ -1394,8 +1256,7 @@ impl<'tcx> InferCtxt<'tcx> {
                     bug!("`{value:?}` is not fully resolved");
                 }
                 if value.has_infer_regions() {
-                    let guar =
-                        self.tcx.dcx().delayed_bug(format!("`{value:?}` is not fully resolved"));
+                    let guar = self.dcx().delayed_bug(format!("`{value:?}` is not fully resolved"));
                     Ok(self.tcx.fold_regions(value, |re, _| {
                         if re.is_var() { ty::Region::new_error(self.tcx, guar) } else { re }
                     }))
@@ -1427,43 +1288,41 @@ impl<'tcx> InferCtxt<'tcx> {
             return inner;
         }
 
-        struct ToFreshVars<'a, 'tcx> {
-            infcx: &'a InferCtxt<'tcx>,
-            span: Span,
-            lbrct: BoundRegionConversionTime,
-            map: FxHashMap<ty::BoundVar, ty::GenericArg<'tcx>>,
+        let bound_vars = value.bound_vars();
+        let mut args = Vec::with_capacity(bound_vars.len());
+
+        for bound_var_kind in bound_vars {
+            let arg: ty::GenericArg<'_> = match bound_var_kind {
+                ty::BoundVariableKind::Ty(_) => self.next_ty_var(span).into(),
+                ty::BoundVariableKind::Region(br) => {
+                    self.next_region_var(BoundRegion(span, br, lbrct)).into()
+                }
+                ty::BoundVariableKind::Const => self.next_const_var(span).into(),
+            };
+            args.push(arg);
         }
 
-        impl<'tcx> BoundVarReplacerDelegate<'tcx> for ToFreshVars<'_, 'tcx> {
+        struct ToFreshVars<'tcx> {
+            args: Vec<ty::GenericArg<'tcx>>,
+        }
+
+        impl<'tcx> BoundVarReplacerDelegate<'tcx> for ToFreshVars<'tcx> {
             fn replace_region(&mut self, br: ty::BoundRegion) -> ty::Region<'tcx> {
-                self.map
-                    .entry(br.var)
-                    .or_insert_with(|| {
-                        self.infcx
-                            .next_region_var(BoundRegion(self.span, br.kind, self.lbrct))
-                            .into()
-                    })
-                    .expect_region()
+                self.args[br.var.index()].expect_region()
             }
             fn replace_ty(&mut self, bt: ty::BoundTy) -> Ty<'tcx> {
-                self.map
-                    .entry(bt.var)
-                    .or_insert_with(|| self.infcx.next_ty_var(self.span).into())
-                    .expect_ty()
+                self.args[bt.var.index()].expect_ty()
             }
             fn replace_const(&mut self, bv: ty::BoundVar) -> ty::Const<'tcx> {
-                self.map
-                    .entry(bv)
-                    .or_insert_with(|| self.infcx.next_const_var(self.span).into())
-                    .expect_const()
+                self.args[bv.index()].expect_const()
             }
         }
-        let delegate = ToFreshVars { infcx: self, span, lbrct, map: Default::default() };
+        let delegate = ToFreshVars { args };
         self.tcx.replace_bound_vars_uncached(value, delegate)
     }
 
     /// See the [`region_constraints::RegionConstraintCollector::verify_generic_bound`] method.
-    pub fn verify_generic_bound(
+    pub(crate) fn verify_generic_bound(
         &self,
         origin: SubregionOrigin<'tcx>,
         kind: GenericKind<'tcx>,
@@ -1511,17 +1370,17 @@ impl<'tcx> InferCtxt<'tcx> {
         span: Span,
     ) -> Result<ty::Const<'tcx>, ErrorHandled> {
         match self.const_eval_resolve(param_env, unevaluated, span) {
-            Ok(Some(val)) => Ok(ty::Const::new_value(
+            Ok(Ok(val)) => Ok(ty::Const::new_value(
                 self.tcx,
                 val,
                 self.tcx.type_of(unevaluated.def).instantiate(self.tcx, unevaluated.args),
             )),
-            Ok(None) => {
+            Ok(Err(bad_ty)) => {
                 let tcx = self.tcx;
                 let def_id = unevaluated.def;
                 span_bug!(
                     tcx.def_span(def_id),
-                    "unable to construct a constant value for the unevaluated constant {:?}",
+                    "unable to construct a valtree for the unevaluated constant {:?}: type {bad_ty} is not valtree-compatible",
                     unevaluated
                 );
             }
@@ -1533,10 +1392,10 @@ impl<'tcx> InferCtxt<'tcx> {
     ///
     /// The constant can be located on a trait like `<A as B>::C`, in which case the given
     /// generic parameters and environment are used to resolve the constant. Alternatively if the
-    /// constant has generic parameters in scope the instantiations are used to evaluate the value of
-    /// the constant. For example in `fn foo<T>() { let _ = [0; bar::<T>()]; }` the repeat count
-    /// constant `bar::<T>()` requires a instantiation for `T`, if the instantiation for `T` is still
-    /// too generic for the constant to be evaluated then `Err(ErrorHandled::TooGeneric)` is
+    /// constant has generic parameters in scope the instantiations are used to evaluate the value
+    /// of the constant. For example in `fn foo<T>() { let _ = [0; bar::<T>()]; }` the repeat count
+    /// constant `bar::<T>()` requires a instantiation for `T`, if the instantiation for `T` is
+    /// still too generic for the constant to be evaluated then `Err(ErrorHandled::TooGeneric)` is
     /// returned.
     ///
     /// This handles inferences variables within both `param_env` and `args` by
@@ -1591,7 +1450,7 @@ impl<'tcx> InferCtxt<'tcx> {
         // This hoists the borrow/release out of the loop body.
         let inner = self.inner.try_borrow();
 
-        return move |infer_var: TyOrConstInferVar| match (infer_var, &inner) {
+        move |infer_var: TyOrConstInferVar| match (infer_var, &inner) {
             (TyOrConstInferVar::Ty(ty_var), Ok(inner)) => {
                 use self::type_variable::TypeVariableValue;
 
@@ -1601,7 +1460,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 )
             }
             _ => false,
-        };
+        }
     }
 
     /// `ty_or_const_infer_var_changed` is equivalent to one of these two:
@@ -1673,60 +1532,6 @@ impl<'tcx> InferCtxt<'tcx> {
     }
 }
 
-impl<'tcx> TypeErrCtxt<'_, 'tcx> {
-    // [Note-Type-error-reporting]
-    // An invariant is that anytime the expected or actual type is Error (the special
-    // error type, meaning that an error occurred when typechecking this expression),
-    // this is a derived error. The error cascaded from another error (that was already
-    // reported), so it's not useful to display it to the user.
-    // The following methods implement this logic.
-    // They check if either the actual or expected type is Error, and don't print the error
-    // in this case. The typechecker should only ever report type errors involving mismatched
-    // types using one of these methods, and should not call span_err directly for such
-    // errors.
-    pub fn type_error_struct_with_diag<M>(
-        &self,
-        sp: Span,
-        mk_diag: M,
-        actual_ty: Ty<'tcx>,
-    ) -> Diag<'tcx>
-    where
-        M: FnOnce(String) -> Diag<'tcx>,
-    {
-        let actual_ty = self.resolve_vars_if_possible(actual_ty);
-        debug!("type_error_struct_with_diag({:?}, {:?})", sp, actual_ty);
-
-        let mut err = mk_diag(self.ty_to_string(actual_ty));
-
-        // Don't report an error if actual type is `Error`.
-        if actual_ty.references_error() {
-            err.downgrade_to_delayed_bug();
-        }
-
-        err
-    }
-
-    pub fn report_mismatched_types(
-        &self,
-        cause: &ObligationCause<'tcx>,
-        expected: Ty<'tcx>,
-        actual: Ty<'tcx>,
-        err: TypeError<'tcx>,
-    ) -> Diag<'tcx> {
-        self.report_and_explain_type_error(TypeTrace::types(cause, true, expected, actual), err)
-    }
-
-    pub fn report_mismatched_consts(
-        &self,
-        cause: &ObligationCause<'tcx>,
-        expected: ty::Const<'tcx>,
-        actual: ty::Const<'tcx>,
-        err: TypeError<'tcx>,
-    ) -> Diag<'tcx> {
-        self.report_and_explain_type_error(TypeTrace::consts(cause, true, expected, actual), err)
-    }
-}
-
 /// Helper for [InferCtxt::ty_or_const_infer_var_changed] (see comment on that), currently
 /// used only for `traits::fulfill`'s list of `stalled_on` inference variables.
 #[derive(Copy, Clone, Debug)]
@@ -1785,7 +1590,7 @@ struct InferenceLiteralEraser<'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for InferenceLiteralEraser<'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -1811,7 +1616,7 @@ impl<'tcx> TypeTrace<'tcx> {
     ) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: Terms(ExpectedFound::new(a_is_expected, a.into(), b.into())),
+            values: ValuePairs::Terms(ExpectedFound::new(a_is_expected, a.into(), b.into())),
         }
     }
 
@@ -1823,7 +1628,7 @@ impl<'tcx> TypeTrace<'tcx> {
     ) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: TraitRefs(ExpectedFound::new(a_is_expected, a, b)),
+            values: ValuePairs::TraitRefs(ExpectedFound::new(a_is_expected, a, b)),
         }
     }
 
@@ -1835,7 +1640,7 @@ impl<'tcx> TypeTrace<'tcx> {
     ) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: Terms(ExpectedFound::new(a_is_expected, a.into(), b.into())),
+            values: ValuePairs::Terms(ExpectedFound::new(a_is_expected, a.into(), b.into())),
         }
     }
 }
@@ -1846,7 +1651,7 @@ impl<'tcx> SubregionOrigin<'tcx> {
             Subtype(ref a) => a.span(),
             RelateObjectBound(a) => a,
             RelateParamBound(a, ..) => a,
-            RelateRegionParamBound(a) => a,
+            RelateRegionParamBound(a, _) => a,
             Reborrow(a) => a,
             ReferenceOutlivesReferent(_, a) => a,
             CompareImplItemObligation { span, .. } => span,
@@ -1887,6 +1692,10 @@ impl<'tcx> SubregionOrigin<'tcx> {
                 SubregionOrigin::AscribeUserTypeProvePredicate(span)
             }
 
+            traits::ObligationCauseCode::ObjectTypeBound(ty, _reg) => {
+                SubregionOrigin::RelateRegionParamBound(cause.span, Some(ty))
+            }
+
             _ => default(),
         }
     }
@@ -1897,7 +1706,7 @@ impl RegionVariableOrigin {
         match *self {
             MiscVariable(a)
             | PatternRegion(a)
-            | AddrOfRegion(a)
+            | BorrowRegion(a)
             | Autoref(a)
             | Coercion(a)
             | RegionParameterDefinition(a, ..)
@@ -1921,7 +1730,7 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
     }
 
     impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReplaceParamAndInferWithPlaceholder<'tcx> {
-        fn interner(&self) -> TyCtxt<'tcx> {
+        fn cx(&self) -> TyCtxt<'tcx> {
             self.tcx
         }
 
@@ -1932,16 +1741,13 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
                     self.idx += 1;
                     idx
                 };
-                Ty::new_placeholder(
-                    self.tcx,
-                    ty::PlaceholderType {
-                        universe: ty::UniverseIndex::ROOT,
-                        bound: ty::BoundTy {
-                            var: ty::BoundVar::from_u32(idx),
-                            kind: ty::BoundTyKind::Anon,
-                        },
+                Ty::new_placeholder(self.tcx, ty::PlaceholderType {
+                    universe: ty::UniverseIndex::ROOT,
+                    bound: ty::BoundTy {
+                        var: ty::BoundVar::from_u32(idx),
+                        kind: ty::BoundTyKind::Anon,
                     },
-                )
+                })
             } else {
                 t.super_fold_with(self)
             }
@@ -1949,17 +1755,14 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
 
         fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
             if let ty::ConstKind::Infer(_) = c.kind() {
-                ty::Const::new_placeholder(
-                    self.tcx,
-                    ty::PlaceholderConst {
-                        universe: ty::UniverseIndex::ROOT,
-                        bound: ty::BoundVar::from_u32({
-                            let idx = self.idx;
-                            self.idx += 1;
-                            idx
-                        }),
-                    },
-                )
+                ty::Const::new_placeholder(self.tcx, ty::PlaceholderConst {
+                    universe: ty::UniverseIndex::ROOT,
+                    bound: ty::BoundVar::from_u32({
+                        let idx = self.idx;
+                        self.idx += 1;
+                        idx
+                    }),
+                })
             } else {
                 c.super_fold_with(self)
             }
@@ -1967,4 +1770,33 @@ fn replace_param_and_infer_args_with_placeholder<'tcx>(
     }
 
     args.fold_with(&mut ReplaceParamAndInferWithPlaceholder { tcx, idx: 0 })
+}
+
+impl<'tcx> InferCtxt<'tcx> {
+    /// Given a [`hir::Block`], get the span of its last expression or
+    /// statement, peeling off any inner blocks.
+    pub fn find_block_span(&self, block: &'tcx hir::Block<'tcx>) -> Span {
+        let block = block.innermost_block();
+        if let Some(expr) = &block.expr {
+            expr.span
+        } else if let Some(stmt) = block.stmts.last() {
+            // possibly incorrect trailing `;` in the else arm
+            stmt.span
+        } else {
+            // empty block; point at its entirety
+            block.span
+        }
+    }
+
+    /// Given a [`hir::HirId`] for a block, get the span of its last expression
+    /// or statement, peeling off any inner blocks.
+    pub fn find_block_span_from_hir_id(&self, hir_id: hir::HirId) -> Span {
+        match self.tcx.hir_node(hir_id) {
+            hir::Node::Block(blk) => self.find_block_span(blk),
+            // The parser was in a weird state if either of these happen, but
+            // it's better not to panic.
+            hir::Node::Expr(e) => e.span,
+            _ => rustc_span::DUMMY_SP,
+        }
+    }
 }

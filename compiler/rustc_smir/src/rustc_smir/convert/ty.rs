@@ -6,7 +6,7 @@ use stable_mir::ty::{
     AdtKind, FloatTy, GenericArgs, GenericParamDef, IntTy, Region, RigidTy, TyKind, UintTy,
 };
 
-use crate::rustc_smir::{alloc, Stable, Tables};
+use crate::rustc_smir::{Stable, Tables, alloc};
 
 impl<'tcx> Stable<'tcx> for ty::AliasTyKind {
     type T = stable_mir::ty::AliasKind;
@@ -68,7 +68,7 @@ impl<'tcx> Stable<'tcx> for ty::ExistentialTraitRef<'tcx> {
     type T = stable_mir::ty::ExistentialTraitRef;
 
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
-        let ty::ExistentialTraitRef { def_id, args } = self;
+        let ty::ExistentialTraitRef { def_id, args, .. } = self;
         stable_mir::ty::ExistentialTraitRef {
             def_id: tables.trait_def(*def_id),
             generic_args: args.stable(tables),
@@ -95,7 +95,7 @@ impl<'tcx> Stable<'tcx> for ty::ExistentialProjection<'tcx> {
     type T = stable_mir::ty::ExistentialProjection;
 
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
-        let ty::ExistentialProjection { def_id, args, term } = self;
+        let ty::ExistentialProjection { def_id, args, term, .. } = self;
         stable_mir::ty::ExistentialProjection {
             def_id: tables.trait_def(*def_id),
             generic_args: args.stable(tables),
@@ -119,6 +119,7 @@ impl<'tcx> Stable<'tcx> for ty::adjustment::PointerCoercion {
             }
             PointerCoercion::ArrayToPointer => stable_mir::mir::PointerCoercion::ArrayToPointer,
             PointerCoercion::Unsize => stable_mir::mir::PointerCoercion::Unsize,
+            PointerCoercion::DynStar => unreachable!("represented as `CastKind::DynStar` in smir"),
         }
     }
 }
@@ -304,10 +305,10 @@ impl<'tcx> Stable<'tcx> for ty::FloatTy {
 
     fn stable(&self, _: &mut Tables<'_>) -> Self::T {
         match self {
-            ty::FloatTy::F16 => unimplemented!("f16_f128"),
+            ty::FloatTy::F16 => FloatTy::F16,
             ty::FloatTy::F32 => FloatTy::F32,
             ty::FloatTy::F64 => FloatTy::F64,
-            ty::FloatTy::F128 => unimplemented!("f16_f128"),
+            ty::FloatTy::F128 => FloatTy::F128,
         }
     }
 }
@@ -352,7 +353,9 @@ impl<'tcx> Stable<'tcx> for ty::TyKind<'tcx> {
             ty::FnDef(def_id, generic_args) => {
                 TyKind::RigidTy(RigidTy::FnDef(tables.fn_def(*def_id), generic_args.stable(tables)))
             }
-            ty::FnPtr(poly_fn_sig) => TyKind::RigidTy(RigidTy::FnPtr(poly_fn_sig.stable(tables))),
+            ty::FnPtr(sig_tys, hdr) => {
+                TyKind::RigidTy(RigidTy::FnPtr(sig_tys.with(*hdr).stable(tables)))
+            }
             ty::Dynamic(existential_predicates, region, dyn_kind) => {
                 TyKind::RigidTy(RigidTy::Dynamic(
                     existential_predicates
@@ -409,7 +412,7 @@ impl<'tcx> Stable<'tcx> for ty::Pattern<'tcx> {
     }
 }
 
-pub fn mir_const_from_ty_const<'tcx>(
+pub(crate) fn mir_const_from_ty_const<'tcx>(
     tables: &mut Tables<'tcx>,
     ty_const: ty::Const<'tcx>,
     ty: Ty<'tcx>,
@@ -600,7 +603,7 @@ impl<'tcx> Stable<'tcx> for rustc_middle::ty::GenericParamDefKind {
             ty::GenericParamDefKind::Type { has_default, synthetic } => {
                 GenericParamDefKind::Type { has_default: *has_default, synthetic: *synthetic }
             }
-            ty::GenericParamDefKind::Const { has_default, is_host_effect: _ } => {
+            ty::GenericParamDefKind::Const { has_default, is_host_effect: _, synthetic: _ } => {
                 GenericParamDefKind::Const { has_default: *has_default }
             }
         }
@@ -630,8 +633,8 @@ impl<'tcx> Stable<'tcx> for ty::PredicateKind<'tcx> {
             PredicateKind::Clause(clause_kind) => {
                 stable_mir::ty::PredicateKind::Clause(clause_kind.stable(tables))
             }
-            PredicateKind::ObjectSafe(did) => {
-                stable_mir::ty::PredicateKind::ObjectSafe(tables.trait_def(*did))
+            PredicateKind::DynCompatible(did) => {
+                stable_mir::ty::PredicateKind::DynCompatible(tables.trait_def(*did))
             }
             PredicateKind::Subtype(subtype_predicate) => {
                 stable_mir::ty::PredicateKind::SubType(subtype_predicate.stable(tables))
@@ -813,10 +816,12 @@ impl<'tcx> Stable<'tcx> for ty::RegionKind<'tcx> {
                 index: early_reg.index,
                 name: early_reg.name.to_string(),
             }),
-            ty::ReBound(db_index, bound_reg) => RegionKind::ReBound(
-                db_index.as_u32(),
-                BoundRegion { var: bound_reg.var.as_u32(), kind: bound_reg.kind.stable(tables) },
-            ),
+            ty::ReBound(db_index, bound_reg) => {
+                RegionKind::ReBound(db_index.as_u32(), BoundRegion {
+                    var: bound_reg.var.as_u32(),
+                    kind: bound_reg.kind.stable(tables),
+                })
+            }
             ty::ReStatic => RegionKind::ReStatic,
             ty::RePlaceholder(place_holder) => {
                 RegionKind::RePlaceholder(stable_mir::ty::Placeholder {
@@ -839,22 +844,21 @@ impl<'tcx> Stable<'tcx> for ty::Instance<'tcx> {
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
         let def = tables.instance_def(tables.tcx.lift(*self).unwrap());
         let kind = match self.def {
-            ty::InstanceDef::Item(..) => stable_mir::mir::mono::InstanceKind::Item,
-            ty::InstanceDef::Intrinsic(..) => stable_mir::mir::mono::InstanceKind::Intrinsic,
-            ty::InstanceDef::Virtual(_def_id, idx) => {
+            ty::InstanceKind::Item(..) => stable_mir::mir::mono::InstanceKind::Item,
+            ty::InstanceKind::Intrinsic(..) => stable_mir::mir::mono::InstanceKind::Intrinsic,
+            ty::InstanceKind::Virtual(_def_id, idx) => {
                 stable_mir::mir::mono::InstanceKind::Virtual { idx }
             }
-            ty::InstanceDef::VTableShim(..)
-            | ty::InstanceDef::ReifyShim(..)
-            | ty::InstanceDef::FnPtrAddrShim(..)
-            | ty::InstanceDef::ClosureOnceShim { .. }
-            | ty::InstanceDef::ConstructCoroutineInClosureShim { .. }
-            | ty::InstanceDef::CoroutineKindShim { .. }
-            | ty::InstanceDef::ThreadLocalShim(..)
-            | ty::InstanceDef::DropGlue(..)
-            | ty::InstanceDef::CloneShim(..)
-            | ty::InstanceDef::FnPtrShim(..)
-            | ty::InstanceDef::AsyncDropGlueCtorShim(..) => {
+            ty::InstanceKind::VTableShim(..)
+            | ty::InstanceKind::ReifyShim(..)
+            | ty::InstanceKind::FnPtrAddrShim(..)
+            | ty::InstanceKind::ClosureOnceShim { .. }
+            | ty::InstanceKind::ConstructCoroutineInClosureShim { .. }
+            | ty::InstanceKind::ThreadLocalShim(..)
+            | ty::InstanceKind::DropGlue(..)
+            | ty::InstanceKind::CloneShim(..)
+            | ty::InstanceKind::FnPtrShim(..)
+            | ty::InstanceKind::AsyncDropGlueCtorShim(..) => {
                 stable_mir::mir::mono::InstanceKind::Shim
             }
         };
@@ -866,10 +870,10 @@ impl<'tcx> Stable<'tcx> for ty::Variance {
     type T = stable_mir::mir::Variance;
     fn stable(&self, _: &mut Tables<'_>) -> Self::T {
         match self {
-            ty::Variance::Bivariant => stable_mir::mir::Variance::Bivariant,
-            ty::Variance::Contravariant => stable_mir::mir::Variance::Contravariant,
-            ty::Variance::Covariant => stable_mir::mir::Variance::Covariant,
-            ty::Variance::Invariant => stable_mir::mir::Variance::Invariant,
+            ty::Bivariant => stable_mir::mir::Variance::Bivariant,
+            ty::Contravariant => stable_mir::mir::Variance::Contravariant,
+            ty::Covariant => stable_mir::mir::Variance::Covariant,
+            ty::Invariant => stable_mir::mir::Variance::Invariant,
         }
     }
 }
@@ -909,7 +913,7 @@ impl<'tcx> Stable<'tcx> for rustc_target::spec::abi::Abi {
             abi::Abi::AvrInterrupt => Abi::AvrInterrupt,
             abi::Abi::AvrNonBlockingInterrupt => Abi::AvrNonBlockingInterrupt,
             abi::Abi::CCmseNonSecureCall => Abi::CCmseNonSecureCall,
-            abi::Abi::Wasm => Abi::Wasm,
+            abi::Abi::CCmseNonSecureEntry => Abi::CCmseNonSecureEntry,
             abi::Abi::System { unwind } => Abi::System { unwind },
             abi::Abi::RustIntrinsic => Abi::RustIntrinsic,
             abi::Abi::RustCall => Abi::RustCall,

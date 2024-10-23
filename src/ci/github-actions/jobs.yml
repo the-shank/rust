@@ -5,6 +5,11 @@ runners:
     env: { }
 
   - &job-linux-4c
+    os: ubuntu-20.04
+    <<: *base-job
+
+  # Large runner used mainly for its bigger disk capacity
+  - &job-linux-4c-largedisk
     os: ubuntu-20.04-4core-16gb
     <<: *base-job
 
@@ -24,6 +29,10 @@ runners:
     os: macos-14
     <<: *base-job
 
+  - &job-windows
+    os: windows-2022
+    <<: *base-job
+
   - &job-windows-8c
     os: windows-2022-8core-32gb
     <<: *base-job
@@ -33,7 +42,7 @@ runners:
     <<: *base-job
 
   - &job-aarch64-linux
-    os: [ self-hosted, ARM64, linux ]
+    os: ubuntu-22.04-arm64-8core-32gb
 
 envs:
   env-x86_64-apple-tests: &env-x86_64-apple-tests
@@ -42,7 +51,7 @@ envs:
     RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
     MACOSX_DEPLOYMENT_TARGET: 10.12
     MACOSX_STD_DEPLOYMENT_TARGET: 10.12
-    SELECT_XCODE: /Applications/Xcode_14.3.1.app
+    SELECT_XCODE: /Applications/Xcode_15.2.app
     NO_LLVM_ASSERTIONS: 1
     NO_DEBUG_ASSERTIONS: 1
     NO_OVERFLOW_CHECKS: 1
@@ -85,9 +94,11 @@ pr:
   - image: mingw-check-tidy
     continue_on_error: true
     <<: *job-linux-4c
-  - image: x86_64-gnu-llvm-17
+  - image: x86_64-gnu-llvm-18
     env:
       ENABLE_GCC_CODEGEN: "1"
+      # We are adding (temporarily) a dummy commit on the compiler
+      READ_ONLY_SRC: "0"
     <<: *job-linux-16c
   - image: x86_64-gnu-tools
     <<: *job-linux-16c
@@ -121,7 +132,7 @@ auto:
   - image: dist-aarch64-linux
     env:
       CODEGEN_BACKENDS: llvm,cranelift
-    <<: *job-linux-4c
+    <<: *job-linux-4c-largedisk
 
   - image: dist-android
     <<: *job-linux-4c
@@ -142,25 +153,28 @@ auto:
     <<: *job-linux-4c
 
   - image: dist-loongarch64-linux
-    <<: *job-linux-4c
+    <<: *job-linux-4c-largedisk
+
+  - image: dist-loongarch64-musl
+    <<: *job-linux-4c-largedisk
 
   - image: dist-ohos
     <<: *job-linux-4c
 
   - image: dist-powerpc-linux
-    <<: *job-linux-4c
+    <<: *job-linux-4c-largedisk
 
   - image: dist-powerpc64-linux
-    <<: *job-linux-4c
+    <<: *job-linux-4c-largedisk
 
   - image: dist-powerpc64le-linux
-    <<: *job-linux-4c
+    <<: *job-linux-4c-largedisk
 
   - image: dist-riscv64-linux
     <<: *job-linux-4c
 
   - image: dist-s390x-linux
-    <<: *job-linux-4c
+    <<: *job-linux-4c-largedisk
 
   - image: dist-various-1
     <<: *job-linux-4c
@@ -205,6 +219,18 @@ auto:
   - image: test-various
     <<: *job-linux-4c
 
+  - image: x86_64-fuchsia
+    # Only run this job on the nightly channel. Fuchsia requires
+    # nightly features to compile, and this job would fail if
+    # executed on beta and stable.
+    only_on_channel: nightly
+    <<: *job-linux-8c
+
+  # Tests integration with Rust for Linux.
+  # Builds stage 1 compiler and tries to compile a few RfL examples with it.
+  - image: x86_64-rust-for-linux
+    <<: *job-linux-8c
+
   - image: x86_64-gnu
     <<: *job-linux-4c
 
@@ -226,27 +252,21 @@ auto:
   - image: x86_64-gnu-aux
     <<: *job-linux-4c
 
-  - image: x86_64-gnu-integration
-    # Only run this job on the nightly channel. Fuchsia requires
-    # nightly features to compile, and this job would fail if
-    # executed on beta and stable.
-    only_on_channel: nightly
-    <<: *job-linux-8c
-
   - image: x86_64-gnu-debug
     <<: *job-linux-4c
 
   - image: x86_64-gnu-distcheck
     <<: *job-linux-8c
 
-  - image: x86_64-gnu-llvm-18
+  - image: x86_64-gnu-llvm-19
     env:
       RUST_BACKTRACE: 1
     <<: *job-linux-8c
 
-  - image: x86_64-gnu-llvm-17
+  - image: x86_64-gnu-llvm-18
     env:
       RUST_BACKTRACE: 1
+      READ_ONLY_SRC: "0"
     <<: *job-linux-8c
 
   - image: x86_64-gnu-nopt
@@ -267,7 +287,7 @@ auto:
       RUST_CONFIGURE_ARGS: --enable-full-tools --enable-sanitizers --enable-profiler --set rust.jemalloc --set rust.lto=thin --set rust.codegen-units=1
       RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
       MACOSX_DEPLOYMENT_TARGET: 10.12
-      SELECT_XCODE: /Applications/Xcode_14.3.1.app
+      SELECT_XCODE: /Applications/Xcode_15.2.app
       NO_LLVM_ASSERTIONS: 1
       NO_DEBUG_ASSERTIONS: 1
       NO_OVERFLOW_CHECKS: 1
@@ -277,11 +297,13 @@ auto:
 
   - image: dist-apple-various
     env:
-      SCRIPT: ./x.py dist bootstrap --include-default-paths --host='' --target=aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim
-      RUST_CONFIGURE_ARGS: --enable-sanitizers --enable-profiler --set rust.jemalloc
+      SCRIPT: ./x.py dist bootstrap --include-default-paths --host='' --target=aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
+      # Mac Catalyst cannot currently compile the sanitizer:
+      # https://github.com/rust-lang/rust/issues/129069
+      RUST_CONFIGURE_ARGS: --enable-sanitizers --enable-profiler --set rust.jemalloc --set target.aarch64-apple-ios-macabi.sanitizers=false --set target.x86_64-apple-ios-macabi.sanitizers=false
       RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
       MACOSX_DEPLOYMENT_TARGET: 10.12
-      SELECT_XCODE: /Applications/Xcode_14.3.1.app
+      SELECT_XCODE: /Applications/Xcode_15.2.app
       NO_LLVM_ASSERTIONS: 1
       NO_DEBUG_ASSERTIONS: 1
       NO_OVERFLOW_CHECKS: 1
@@ -310,7 +332,7 @@ auto:
         --set llvm.ninja=false
         --set rust.lto=thin
       RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
-      SELECT_XCODE: /Applications/Xcode_14.3.1.app
+      SELECT_XCODE: /Applications/Xcode_15.4.app
       USE_XCODE_CLANG: 1
       MACOSX_DEPLOYMENT_TARGET: 11.0
       MACOSX_STD_DEPLOYMENT_TARGET: 11.0
@@ -318,6 +340,7 @@ auto:
       NO_DEBUG_ASSERTIONS: 1
       NO_OVERFLOW_CHECKS: 1
       DIST_REQUIRE_ALL_TOOLS: 1
+      CODEGEN_BACKENDS: llvm,cranelift
     <<: *job-macos-m1
 
   # This target only needs to support 11.0 and up as nothing else supports the hardware
@@ -329,7 +352,7 @@ auto:
         --enable-profiler
         --set rust.jemalloc
       RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
-      SELECT_XCODE: /Applications/Xcode_14.3.1.app
+      SELECT_XCODE: /Applications/Xcode_15.4.app
       USE_XCODE_CLANG: 1
       MACOSX_DEPLOYMENT_TARGET: 11.0
       MACOSX_STD_DEPLOYMENT_TARGET: 11.0
@@ -362,6 +385,20 @@ auto:
       DEPLOY_TOOLSTATES_JSON: toolstates-windows.json
     <<: *job-windows-8c
 
+  # Temporary builder to workaround CI issues
+  # See <https://github.com/rust-lang/rust/issues/127883>
+  #FIXME: Remove this, and re-enable the same tests in `checktools.sh`, once CI issues are fixed.
+  - image: x86_64-msvc-ext2
+    env:
+      SCRIPT: >
+        python x.py test --stage 2 src/tools/miri --target aarch64-apple-darwin --test-args pass &&
+        python x.py test --stage 2 src/tools/miri --target i686-pc-windows-gnu --test-args pass &&
+        python x.py miri --stage 2 library/core --test-args notest &&
+        python x.py miri --stage 2 library/alloc --test-args notest &&
+        python x.py miri --stage 2 library/std --test-args notest
+      RUST_CONFIGURE_ARGS: --build=x86_64-pc-windows-msvc --enable-lld
+    <<: *job-windows
+
   # 32/64-bit MinGW builds.
   #
   # We are using MinGW with POSIX threads since LLVM requires
@@ -390,9 +427,7 @@ auto:
   - image: x86_64-mingw
     env:
       SCRIPT: make ci-mingw
-      RUST_CONFIGURE_ARGS: >-
-        --build=x86_64-pc-windows-gnu
-        --enable-profiler
+      RUST_CONFIGURE_ARGS: --build=x86_64-pc-windows-gnu
       # We are intentionally allowing an old toolchain on this builder (and that's
       # incompatible with LLVM downloads today).
       NO_DOWNLOAD_CI_LLVM: 1
@@ -409,6 +444,7 @@ auto:
         --set rust.codegen-units=1
       SCRIPT: python x.py build --set rust.debug=true opt-dist && PGO_HOST=x86_64-pc-windows-msvc ./build/x86_64-pc-windows-msvc/stage0-tools-bin/opt-dist windows-ci -- python x.py dist bootstrap --include-default-paths
       DIST_REQUIRE_ALL_TOOLS: 1
+      CODEGEN_BACKENDS: llvm,cranelift
     <<: *job-windows-8c
 
   - image: dist-i686-msvc
@@ -421,6 +457,7 @@ auto:
         --enable-profiler
       SCRIPT: python x.py dist bootstrap --include-default-paths
       DIST_REQUIRE_ALL_TOOLS: 1
+      CODEGEN_BACKENDS: llvm,cranelift
     <<: *job-windows-8c
 
   - image: dist-aarch64-msvc
@@ -428,6 +465,7 @@ auto:
       RUST_CONFIGURE_ARGS: >-
         --build=x86_64-pc-windows-msvc
         --host=aarch64-pc-windows-msvc
+        --target=aarch64-pc-windows-msvc,arm64ec-pc-windows-msvc
         --enable-full-tools
         --enable-profiler
       SCRIPT: python x.py dist bootstrap --include-default-paths
@@ -439,12 +477,12 @@ auto:
       RUST_CONFIGURE_ARGS: >-
         --build=i686-pc-windows-gnu
         --enable-full-tools
-        --enable-profiler
       # We are intentionally allowing an old toolchain on this builder (and that's
       # incompatible with LLVM downloads today).
       NO_DOWNLOAD_CI_LLVM: 1
       SCRIPT: python x.py dist bootstrap --include-default-paths
       DIST_REQUIRE_ALL_TOOLS: 1
+      CODEGEN_BACKENDS: llvm,cranelift
     <<: *job-windows-8c
 
   - image: dist-x86_64-mingw
@@ -453,11 +491,11 @@ auto:
       RUST_CONFIGURE_ARGS: >-
         --build=x86_64-pc-windows-gnu
         --enable-full-tools
-        --enable-profiler
       # We are intentionally allowing an old toolchain on this builder (and that's
       # incompatible with LLVM downloads today).
       NO_DOWNLOAD_CI_LLVM: 1
       DIST_REQUIRE_ALL_TOOLS: 1
+      CODEGEN_BACKENDS: llvm,cranelift
     <<: *job-windows-8c
 
   - image: dist-x86_64-msvc-alt
@@ -465,8 +503,3 @@ auto:
       RUST_CONFIGURE_ARGS: --build=x86_64-pc-windows-msvc --enable-extended --enable-profiler
       SCRIPT: python x.py dist bootstrap --include-default-paths
     <<: *job-windows-8c
-
-  # Tests integration with Rust for Linux.
-  # Builds stage 1 compiler and tries to compile a few RfL examples with it.
-  - image: rfl
-    <<: *job-linux-8c

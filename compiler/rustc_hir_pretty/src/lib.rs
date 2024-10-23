@@ -1,25 +1,27 @@
 //! HIR pretty-printing is layered on top of AST pretty-printing. A number of
 //! the definitions in this file have equivalents in `rustc_ast_pretty`.
 
+// tidy-alphabetical-start
 #![recursion_limit = "256"]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
-use rustc_ast as ast;
+use std::cell::Cell;
+use std::vec;
+
 use rustc_ast::util::parser::{self, AssocOp, Fixity};
 use rustc_ast_pretty::pp::Breaks::{Consistent, Inconsistent};
 use rustc_ast_pretty::pp::{self, Breaks};
 use rustc_ast_pretty::pprust::{Comments, PrintState};
-use rustc_hir as hir;
 use rustc_hir::{
-    BindingMode, ByRef, GenericArg, GenericBound, GenericParam, GenericParamKind, HirId,
-    LifetimeParamKind, Node, PatKind, RangeEnd, Term, TraitBoundModifier,
+    BindingMode, ByRef, ConstArgKind, GenericArg, GenericBound, GenericParam, GenericParamKind,
+    HirId, LifetimeParamKind, Node, PatKind, PreciseCapturingArg, RangeEnd, Term,
 };
-use rustc_span::source_map::SourceMap;
-use rustc_span::symbol::{kw, Ident, Symbol};
 use rustc_span::FileName;
+use rustc_span::source_map::SourceMap;
+use rustc_span::symbol::{Ident, Symbol, kw};
 use rustc_target::spec::abi::Abi;
-
-use std::cell::Cell;
-use std::vec;
+use {rustc_ast as ast, rustc_hir as hir};
 
 pub fn id_to_string(map: &dyn rustc_hir::intravisit::Map<'_>, hir_id: HirId) -> String {
     to_string(&map, |s| s.print_node(map.hir_node(hir_id)))
@@ -85,6 +87,7 @@ impl<'a> State<'a> {
             Node::Variant(a) => self.print_variant(a),
             Node::AnonConst(a) => self.print_anon_const(a),
             Node::ConstBlock(a) => self.print_inline_const(a),
+            Node::ConstArg(a) => self.print_const_arg(a),
             Node::Expr(a) => self.print_expr(a),
             Node::ExprField(a) => self.print_expr_field(a),
             Node::Stmt(a) => self.print_stmt(a),
@@ -92,6 +95,7 @@ impl<'a> State<'a> {
             Node::Ty(a) => self.print_type(a),
             Node::AssocItemConstraint(a) => self.print_assoc_item_constraint(a),
             Node::TraitRef(a) => self.print_trait_ref(a),
+            Node::OpaqueTy(o) => self.print_opaque_ty(o),
             Node::Pat(a) => self.print_pat(a),
             Node::PatField(a) => self.print_patfield(a),
             Node::Arm(a) => self.print_arm(a),
@@ -346,16 +350,11 @@ impl<'a> State<'a> {
         self.maybe_print_comment(item.span.lo());
         self.print_outer_attributes(self.attrs(item.hir_id()));
         match item.kind {
-            hir::ForeignItemKind::Fn(decl, arg_names, generics, safety) => {
+            hir::ForeignItemKind::Fn(sig, arg_names, generics) => {
                 self.head("");
                 self.print_fn(
-                    decl,
-                    hir::FnHeader {
-                        safety,
-                        constness: hir::Constness::NotConst,
-                        abi: Abi::Rust,
-                        asyncness: hir::IsAsync::NotAsync,
-                    },
+                    sig.decl,
+                    sig.header,
                     Some(item.ident.name),
                     generics,
                     arg_names,
@@ -566,11 +565,6 @@ impl<'a> State<'a> {
                     state.print_type(ty);
                 });
             }
-            hir::ItemKind::OpaqueTy(opaque_ty) => {
-                self.print_item_type(item, opaque_ty.generics, |state| {
-                    state.print_bounds("= impl", opaque_ty.bounds)
-                });
-            }
             hir::ItemKind::Enum(ref enum_definition, params) => {
                 self.print_enum_def(enum_definition, params, item.ident.name, item.span);
             }
@@ -583,6 +577,7 @@ impl<'a> State<'a> {
                 self.print_struct(struct_def, generics, item.ident.name, item.span, true);
             }
             hir::ItemKind::Impl(&hir::Impl {
+                constness,
                 safety,
                 polarity,
                 defaultness,
@@ -596,6 +591,10 @@ impl<'a> State<'a> {
                 self.print_defaultness(defaultness);
                 self.print_safety(safety);
                 self.word_nbsp("impl");
+
+                if let hir::Constness::Const = constness {
+                    self.word_nbsp("const");
+                }
 
                 if !generics.params.is_empty() {
                     self.print_generic_params(generics.params);
@@ -658,6 +657,15 @@ impl<'a> State<'a> {
         self.print_path(t.path, false);
     }
 
+    fn print_opaque_ty(&mut self, o: &hir::OpaqueTy<'_>) {
+        self.head("opaque");
+        self.print_generic_params(o.generics.params);
+        self.print_where_clause(o.generics);
+        self.word("{");
+        self.print_bounds("impl", o.bounds);
+        self.word("}");
+    }
+
     fn print_formal_generic_params(&mut self, generic_params: &[hir::GenericParam<'_>]) {
         if !generic_params.is_empty() {
             self.word("for");
@@ -667,6 +675,17 @@ impl<'a> State<'a> {
     }
 
     fn print_poly_trait_ref(&mut self, t: &hir::PolyTraitRef<'_>) {
+        let hir::TraitBoundModifiers { constness, polarity } = t.modifiers;
+        match constness {
+            hir::BoundConstness::Never => {}
+            hir::BoundConstness::Always(_) => self.word("const"),
+            hir::BoundConstness::Maybe(_) => self.word("~const"),
+        }
+        match polarity {
+            hir::BoundPolarity::Positive => {}
+            hir::BoundPolarity::Negative(_) => self.word("!"),
+            hir::BoundPolarity::Maybe(_) => self.word("?"),
+        }
         self.print_formal_generic_params(t.bound_generic_params);
         self.print_trait_ref(&t.trait_ref);
     }
@@ -976,12 +995,19 @@ impl<'a> State<'a> {
     fn print_array_length(&mut self, len: &hir::ArrayLen<'_>) {
         match len {
             hir::ArrayLen::Infer(..) => self.word("_"),
-            hir::ArrayLen::Body(ct) => self.print_anon_const(ct),
+            hir::ArrayLen::Body(ct) => self.print_const_arg(ct),
         }
     }
 
     fn print_anon_const(&mut self, constant: &hir::AnonConst) {
         self.ann.nested(self, Nested::Body(constant.body))
+    }
+
+    fn print_const_arg(&mut self, const_arg: &hir::ConstArg<'_>) {
+        match &const_arg.kind {
+            ConstArgKind::Path(qpath) => self.print_qpath(qpath, true),
+            ConstArgKind::Anon(anon) => self.print_anon_const(anon),
+        }
     }
 
     fn print_call_post(&mut self, args: &[hir::Expr<'_>]) {
@@ -1118,7 +1144,7 @@ impl<'a> State<'a> {
     fn print_expr_call(&mut self, func: &hir::Expr<'_>, args: &[hir::Expr<'_>]) {
         let prec = match func.kind {
             hir::ExprKind::Field(..) => parser::PREC_FORCE_PAREN,
-            _ => parser::PREC_POSTFIX,
+            _ => parser::PREC_UNAMBIGUOUS,
         };
 
         self.print_expr_maybe_paren(func, prec);
@@ -1132,7 +1158,7 @@ impl<'a> State<'a> {
         args: &[hir::Expr<'_>],
     ) {
         let base_args = args;
-        self.print_expr_maybe_paren(receiver, parser::PREC_POSTFIX);
+        self.print_expr_maybe_paren(receiver, parser::PREC_UNAMBIGUOUS);
         self.word(".");
         self.print_ident(segment.ident);
 
@@ -1282,35 +1308,7 @@ impl<'a> State<'a> {
             AsmArg::Options(opts) => {
                 s.word("options");
                 s.popen();
-                let mut options = vec![];
-                if opts.contains(ast::InlineAsmOptions::PURE) {
-                    options.push("pure");
-                }
-                if opts.contains(ast::InlineAsmOptions::NOMEM) {
-                    options.push("nomem");
-                }
-                if opts.contains(ast::InlineAsmOptions::READONLY) {
-                    options.push("readonly");
-                }
-                if opts.contains(ast::InlineAsmOptions::PRESERVES_FLAGS) {
-                    options.push("preserves_flags");
-                }
-                if opts.contains(ast::InlineAsmOptions::NORETURN) {
-                    options.push("noreturn");
-                }
-                if opts.contains(ast::InlineAsmOptions::NOSTACK) {
-                    options.push("nostack");
-                }
-                if opts.contains(ast::InlineAsmOptions::ATT_SYNTAX) {
-                    options.push("att_syntax");
-                }
-                if opts.contains(ast::InlineAsmOptions::RAW) {
-                    options.push("raw");
-                }
-                if opts.contains(ast::InlineAsmOptions::MAY_UNWIND) {
-                    options.push("may_unwind");
-                }
-                s.commasep(Inconsistent, &options, |s, &opt| {
+                s.commasep(Inconsistent, &opts.human_readable_names(), |s, &opt| {
                     s.word(opt);
                 });
                 s.pclose();
@@ -1476,12 +1474,12 @@ impl<'a> State<'a> {
                 self.print_expr_maybe_paren(rhs, prec);
             }
             hir::ExprKind::Field(expr, ident) => {
-                self.print_expr_maybe_paren(expr, parser::PREC_POSTFIX);
+                self.print_expr_maybe_paren(expr, parser::PREC_UNAMBIGUOUS);
                 self.word(".");
                 self.print_ident(ident);
             }
             hir::ExprKind::Index(expr, index, _) => {
-                self.print_expr_maybe_paren(expr, parser::PREC_POSTFIX);
+                self.print_expr_maybe_paren(expr, parser::PREC_UNAMBIGUOUS);
                 self.word("[");
                 self.print_expr(index);
                 self.word("]");
@@ -1672,7 +1670,7 @@ impl<'a> State<'a> {
                             GenericArg::Lifetime(lt) if !elide_lifetimes => s.print_lifetime(lt),
                             GenericArg::Lifetime(_) => {}
                             GenericArg::Type(ty) => s.print_type(ty),
-                            GenericArg::Const(ct) => s.print_anon_const(&ct.value),
+                            GenericArg::Const(ct) => s.print_const_arg(ct),
                             GenericArg::Infer(_inf) => s.word("_"),
                         }
                     });
@@ -1713,7 +1711,7 @@ impl<'a> State<'a> {
                 self.word_space("=");
                 match term {
                     Term::Ty(ty) => self.print_type(ty),
-                    Term::Const(ref c) => self.print_anon_const(c),
+                    Term::Const(ref c) => self.print_const_arg(c),
                 }
             }
             hir::AssocItemConstraintKind::Bound { bounds } => {
@@ -2040,13 +2038,10 @@ impl<'a> State<'a> {
         let generic_params = generic_params
             .iter()
             .filter(|p| {
-                matches!(
-                    p,
-                    GenericParam {
-                        kind: GenericParamKind::Lifetime { kind: LifetimeParamKind::Explicit },
-                        ..
-                    }
-                )
+                matches!(p, GenericParam {
+                    kind: GenericParamKind::Lifetime { kind: LifetimeParamKind::Explicit },
+                    ..
+                })
             })
             .collect::<Vec<_>>();
 
@@ -2089,16 +2084,27 @@ impl<'a> State<'a> {
             }
 
             match bound {
-                GenericBound::Trait(tref, modifier) => {
-                    if modifier == &TraitBoundModifier::Maybe {
-                        self.word("?");
-                    }
+                GenericBound::Trait(tref) => {
                     self.print_poly_trait_ref(tref);
                 }
                 GenericBound::Outlives(lt) => {
                     self.print_lifetime(lt);
                 }
+                GenericBound::Use(args, _) => {
+                    self.word("use <");
+
+                    self.commasep(Inconsistent, args, |s, arg| s.print_precise_capturing_arg(*arg));
+
+                    self.word(">");
+                }
             }
+        }
+    }
+
+    fn print_precise_capturing_arg(&mut self, arg: PreciseCapturingArg<'_>) {
+        match arg {
+            PreciseCapturingArg::Lifetime(lt) => self.print_lifetime(lt),
+            PreciseCapturingArg::Param(arg) => self.print_ident(arg.ident),
         }
     }
 
@@ -2128,13 +2134,13 @@ impl<'a> State<'a> {
                     self.print_type(default);
                 }
             }
-            GenericParamKind::Const { ty, ref default, is_host_effect: _ } => {
+            GenericParamKind::Const { ty, ref default, is_host_effect: _, synthetic: _ } => {
                 self.word_space(":");
                 self.print_type(ty);
                 if let Some(default) = default {
                     self.space();
                     self.word_space("=");
-                    self.print_anon_const(default);
+                    self.print_const_arg(default);
                 }
             }
         }

@@ -1,11 +1,13 @@
-use crate::traits::query::normalize::QueryNormalizeExt;
-use crate::traits::query::NoSolution;
-use crate::traits::{Normalized, ObligationCause, ObligationCtxt};
-
 use rustc_data_structures::fx::FxHashSet;
+use rustc_infer::traits::query::type_op::DropckOutlives;
 use rustc_middle::traits::query::{DropckConstraint, DropckOutlivesResult};
 use rustc_middle::ty::{self, EarlyBinder, ParamEnvAnd, Ty, TyCtxt};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{DUMMY_SP, Span};
+use tracing::{debug, instrument};
+
+use crate::traits::query::NoSolution;
+use crate::traits::query::normalize::QueryNormalizeExt;
+use crate::traits::{Normalized, ObligationCause, ObligationCtxt};
 
 /// This returns true if the type `ty` is "trivial" for
 /// dropck-outlives -- that is, if it doesn't require any types to
@@ -33,7 +35,7 @@ pub fn trivial_dropck_outlives<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         | ty::Float(_)
         | ty::Never
         | ty::FnDef(..)
-        | ty::FnPtr(_)
+        | ty::FnPtr(..)
         | ty::Char
         | ty::CoroutineWitness(..)
         | ty::RawPtr(_, _)
@@ -42,8 +44,15 @@ pub fn trivial_dropck_outlives<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         | ty::Foreign(..)
         | ty::Error(_) => true,
 
-        // `T is PAT`, `[T; N]`, and `[T]` have same properties as T.
-        ty::Pat(ty, _) | ty::Array(ty, _) | ty::Slice(ty) => trivial_dropck_outlives(tcx, *ty),
+        // `T is PAT` and `[T]` have same properties as T.
+        ty::Pat(ty, _) | ty::Slice(ty) => trivial_dropck_outlives(tcx, *ty),
+        ty::Array(ty, size) => {
+            // Empty array never has a dtor. See issue #110288.
+            match size.try_to_target_usize(tcx) {
+                Some(0) => true,
+                _ => trivial_dropck_outlives(tcx, *ty),
+            }
+        }
 
         // (T1..Tn) and closures have same properties as T1..Tn --
         // check if *all* of them are trivial.
@@ -55,7 +64,7 @@ pub fn trivial_dropck_outlives<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         }
 
         ty::Adt(def, _) => {
-            if Some(def.did()) == tcx.lang_items().manually_drop() {
+            if def.is_manually_drop() {
                 // `ManuallyDrop` never has a dtor.
                 true
             } else {
@@ -80,10 +89,10 @@ pub fn trivial_dropck_outlives<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
 
 pub fn compute_dropck_outlives_inner<'tcx>(
     ocx: &ObligationCtxt<'_, 'tcx>,
-    goal: ParamEnvAnd<'tcx, Ty<'tcx>>,
+    goal: ParamEnvAnd<'tcx, DropckOutlives<'tcx>>,
 ) -> Result<DropckOutlivesResult<'tcx>, NoSolution> {
     let tcx = ocx.infcx.tcx;
-    let ParamEnvAnd { param_env, value: for_ty } = goal;
+    let ParamEnvAnd { param_env, value: DropckOutlives { dropped_ty } } = goal;
 
     let mut result = DropckOutlivesResult { kinds: vec![], overflows: vec![] };
 
@@ -91,7 +100,7 @@ pub fn compute_dropck_outlives_inner<'tcx>(
     // something from the stack and invoke
     // `dtorck_constraint_for_ty_inner`. This may produce new types that
     // have to be pushed on the stack. This continues until we have explored
-    // all the reachable types from the type `for_ty`.
+    // all the reachable types from the type `dropped_ty`.
     //
     // Example: Imagine that we have the following code:
     //
@@ -121,7 +130,7 @@ pub fn compute_dropck_outlives_inner<'tcx>(
     // lead to us trying to push `A` a second time -- to prevent
     // infinite recursion, we notice that `A` was already pushed
     // once and stop.
-    let mut ty_stack = vec![(for_ty, 0)];
+    let mut ty_stack = vec![(dropped_ty, 0)];
 
     // Set used to detect infinite recursion.
     let mut ty_set = FxHashSet::default();
@@ -217,7 +226,7 @@ pub fn dtorck_constraint_for_ty_inner<'tcx>(
         | ty::RawPtr(..)
         | ty::Ref(..)
         | ty::FnDef(..)
-        | ty::FnPtr(_)
+        | ty::FnPtr(..)
         | ty::CoroutineWitness(..) => {
             // these types never have a destructor
         }

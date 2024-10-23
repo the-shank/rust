@@ -2,16 +2,14 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/traits/resolution.html#selection
 
-use self::EvaluationResult::*;
-
-use super::{SelectionError, SelectionResult};
 use rustc_errors::ErrorGuaranteed;
-
-use crate::ty;
-
 use rustc_hir::def_id::DefId;
 use rustc_macros::{HashStable, TypeVisitable};
 use rustc_query_system::cache::Cache;
+
+use self::EvaluationResult::*;
+use super::{SelectionError, SelectionResult};
+use crate::ty;
 
 pub type SelectionCache<'tcx> = Cache<
     // This cache does not use `ParamEnvAnd` in its keys because `ParamEnv::and` can replace
@@ -163,9 +161,7 @@ pub enum SelectionCandidate<'tcx> {
 
     /// Implementation of a `Fn`-family trait by one of the anonymous
     /// types generated for a fn pointer type (e.g., `fn(int) -> int`)
-    FnPointerCandidate {
-        fn_host_effect: ty::Const<'tcx>,
-    },
+    FnPointerCandidate,
 
     TraitAliasCandidate,
 
@@ -182,9 +178,6 @@ pub enum SelectionCandidate<'tcx> {
     BuiltinObjectCandidate,
 
     BuiltinUnsizeCandidate,
-
-    /// Implementation of `const Destruct`, optionally from a custom `impl const Drop`.
-    ConstDestructCandidate(Option<DefId>),
 }
 
 /// The result of trait evaluation. The order is important

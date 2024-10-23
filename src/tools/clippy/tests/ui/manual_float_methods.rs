@@ -3,6 +3,8 @@
 #![allow(clippy::needless_if, unused)]
 #![warn(clippy::manual_is_infinite, clippy::manual_is_finite)]
 
+// FIXME(f16_f128): add tests for these types once constants are available
+
 #[macro_use]
 extern crate proc_macros;
 
@@ -37,8 +39,11 @@ fn main() {
     if x != f64::INFINITY && x != fn_test() {}
     // Not -inf
     if x != f64::INFINITY && x != fn_test_not_inf() {}
+    const {
+        let x = 1.0f64;
+        if x == f64::INFINITY || x == f64::NEG_INFINITY {}
+    }
     const X: f64 = 1.0f64;
-    // Will be linted if `const_float_classify` is enabled
     if const { X == f64::INFINITY || X == f64::NEG_INFINITY } {}
     if const { X != f64::INFINITY && X != f64::NEG_INFINITY } {}
     external! {

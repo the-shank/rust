@@ -1,9 +1,23 @@
 //@compile-flags: -Zmiri-strict-provenance
-#![feature(portable_simd, adt_const_params, core_intrinsics, repr_simd)]
+#![feature(
+    portable_simd,
+    unsized_const_params,
+    adt_const_params,
+    rustc_attrs,
+    intrinsics,
+    core_intrinsics,
+    repr_simd
+)]
 #![allow(incomplete_features, internal_features)]
 use std::intrinsics::simd as intrinsics;
 use std::ptr;
-use std::simd::{prelude::*, StdFloat};
+use std::simd::StdFloat;
+use std::simd::prelude::*;
+
+extern "rust-intrinsic" {
+    #[rustc_nounwind]
+    pub fn simd_shuffle_generic<T, U, const IDX: &'static [u32]>(x: T, y: T) -> U;
+}
 
 fn simd_ops_f32() {
     let a = f32x4::splat(10.0);
@@ -606,13 +620,16 @@ fn simd_intrinsics() {
             i32x4::from_array([10, 2, 10, 10])
         );
         assert_eq!(simd_shuffle_generic::<_, i32x4, { &[3, 1, 0, 2] }>(a, b), a,);
-        assert_eq!(simd_shuffle::<_, _, i32x4>(a, b, const { [3u32, 1, 0, 2] }), a,);
+        assert_eq!(
+            simd_shuffle::<_, _, i32x4>(a, b, const { u32x4::from_array([3u32, 1, 0, 2]) }),
+            a,
+        );
         assert_eq!(
             simd_shuffle_generic::<_, i32x4, { &[7, 5, 4, 6] }>(a, b),
             i32x4::from_array([4, 2, 1, 10]),
         );
         assert_eq!(
-            simd_shuffle::<_, _, i32x4>(a, b, const { [7u32, 5, 4, 6] }),
+            simd_shuffle::<_, _, i32x4>(a, b, const { u32x4::from_array([7u32, 5, 4, 6]) }),
             i32x4::from_array([4, 2, 1, 10]),
         );
     }
@@ -658,11 +675,32 @@ fn simd_masked_loadstore() {
     assert_eq!(buf, [2, 3, 4]);
 }
 
+fn simd_ops_non_pow2() {
+    // Just a little smoke test for operations on non-power-of-two vectors.
+    #[repr(simd, packed)]
+    #[derive(Copy, Clone)]
+    pub struct SimdPacked<T, const N: usize>([T; N]);
+    #[repr(simd)]
+    #[derive(Copy, Clone)]
+    pub struct SimdPadded<T, const N: usize>([T; N]);
+
+    let x = SimdPacked([1u32; 3]);
+    let y = SimdPacked([2u32; 3]);
+    let z = unsafe { intrinsics::simd_add(x, y) };
+    assert_eq!({ z.0 }, [3u32; 3]);
+
+    let x = SimdPadded([1u32; 3]);
+    let y = SimdPadded([2u32; 3]);
+    let z = unsafe { intrinsics::simd_add(x, y) };
+    assert_eq!(z.0, [3u32; 3]);
+}
+
 fn main() {
     simd_mask();
     simd_ops_f32();
     simd_ops_f64();
     simd_ops_i32();
+    simd_ops_non_pow2();
     simd_cast();
     simd_swizzle();
     simd_gather_scatter();

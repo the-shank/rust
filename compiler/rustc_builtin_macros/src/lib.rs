@@ -1,31 +1,36 @@
 //! This crate contains implementations of built-in macros and other code generating facilities
 //! injecting code into the crate before it is lowered to HIR.
 
+// tidy-alphabetical-start
 #![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
-#![feature(rustdoc_internals)]
-#![doc(rust_logo)]
+#![cfg_attr(not(bootstrap), feature(autodiff))]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![doc(rust_logo)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(decl_macro)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
-#![feature(lint_reasons)]
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_quote)]
+#![feature(rustdoc_internals)]
 #![feature(try_blocks)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 extern crate proc_macro;
 
-use crate::deriving::*;
 use rustc_expand::base::{MacroExpanderFn, ResolverExpand, SyntaxExtensionKind};
 use rustc_expand::proc_macro::BangProcMacro;
 use rustc_span::symbol::sym;
 
+use crate::deriving::*;
+
 mod alloc_error_handler;
 mod assert;
+mod autodiff;
 mod cfg;
 mod cfg_accessible;
 mod cfg_eval;
@@ -91,6 +96,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         line: source_util::expand_line,
         log_syntax: log_syntax::expand_log_syntax,
         module_path: source_util::expand_mod,
+        naked_asm: asm::expand_naked_asm,
         option_env: env::expand_option_env,
         pattern_type: pattern_type::expand,
         std_panic: edition_panic::expand_panic,
@@ -102,6 +108,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
 
     register_attr! {
         alloc_error_handler: alloc_error_handler::expand,
+        autodiff: autodiff::expand,
         bench: test::expand_bench,
         cfg_accessible: cfg_accessible::Expander,
         cfg_eval: cfg_eval::expand,
@@ -116,6 +123,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         Clone: clone::expand_deriving_clone,
         Copy: bounds::expand_deriving_copy,
         ConstParamTy: bounds::expand_deriving_const_param_ty,
+        UnsizedConstParamTy: bounds::expand_deriving_unsized_const_param_ty,
         Debug: debug::expand_deriving_debug,
         Default: default::expand_deriving_default,
         Eq: eq::expand_deriving_eq,
@@ -125,6 +133,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         PartialOrd: partial_ord::expand_deriving_partial_ord,
         RustcDecodable: decodable::expand_deriving_rustc_decodable,
         RustcEncodable: encodable::expand_deriving_rustc_encodable,
+        SmartPointer: smart_ptr::expand_deriving_smart_ptr,
     }
 
     let client = proc_macro::bridge::client::Client::expand1(proc_macro::quote);

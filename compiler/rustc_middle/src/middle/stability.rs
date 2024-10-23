@@ -1,9 +1,8 @@
 //! A pass that annotates every item and method with its stability level,
 //! propagating default levels lexically from parent to children ast nodes.
 
-pub use self::StabilityLevel::*;
+use std::num::NonZero;
 
-use crate::ty::{self, TyCtxt};
 use rustc_ast::NodeId;
 use rustc_attr::{
     self as attr, ConstStability, DefaultBodyStability, DeprecatedSince, Deprecation, Stability,
@@ -16,14 +15,16 @@ use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap};
 use rustc_hir::{self as hir, HirId};
 use rustc_macros::{Decodable, Encodable, HashStable, Subdiagnostic};
 use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_session::Session;
 use rustc_session::lint::builtin::{DEPRECATED, DEPRECATED_IN_FUTURE, SOFT_UNSTABLE};
 use rustc_session::lint::{BuiltinLintDiag, DeprecatedSinceKind, Level, Lint, LintBuffer};
 use rustc_session::parse::feature_err_issue;
-use rustc_session::Session;
-use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
-use std::num::NonZero;
+use rustc_span::symbol::{Symbol, sym};
 use tracing::debug;
+
+pub use self::StabilityLevel::*;
+use crate::ty::{self, TyCtxt};
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum StabilityLevel {
@@ -112,7 +113,7 @@ pub fn report_unstable(
 ) {
     let msg = match reason {
         Some(r) => format!("use of unstable library feature '{feature}': {r}"),
-        None => format!("use of unstable library feature '{}'", &feature),
+        None => format!("use of unstable library feature '{feature}'"),
     };
 
     if is_soft {
@@ -176,7 +177,7 @@ impl<'a, G: EmissionGuarantee> rustc_errors::LintDiagnostic<'a, G> for Deprecate
             diag.arg("has_note", false);
         }
         if let Some(sub) = self.sub {
-            diag.subdiagnostic(diag.dcx, sub);
+            diag.subdiagnostic(sub);
         }
     }
 }
@@ -216,7 +217,7 @@ pub fn early_report_macro_deprecation(
         suggestion_span: span,
         note: depr.note,
         path,
-        since_kind: deprecated_since_kind(is_in_effect, depr.since.clone()),
+        since_kind: deprecated_since_kind(is_in_effect, depr.since),
     };
     lint_buffer.buffer_lint(deprecation_lint(is_in_effect), node_id, span, diag);
 }
@@ -421,15 +422,15 @@ impl<'tcx> TyCtxt<'tcx> {
                     debug!("stability: skipping span={:?} since it is internal", span);
                     return EvalResult::Allow;
                 }
-                if self.features().declared(feature) {
+                if self.features().enabled(feature) {
                     return EvalResult::Allow;
                 }
 
                 // If this item was previously part of a now-stabilized feature which is still
-                // active (i.e. the user hasn't removed the attribute for the stabilized feature
+                // enabled (i.e. the user hasn't removed the attribute for the stabilized feature
                 // yet) then allow use of this item.
                 if let Some(implied_by) = implied_by
-                    && self.features().declared(implied_by)
+                    && self.features().enabled(implied_by)
                 {
                     return EvalResult::Allow;
                 }
@@ -443,10 +444,11 @@ impl<'tcx> TyCtxt<'tcx> {
                 // the `-Z force-unstable-if-unmarked` flag present (we're
                 // compiling a compiler crate), then let this missing feature
                 // annotation slide.
-                if feature == sym::rustc_private && issue == NonZero::new(27812) {
-                    if self.sess.opts.unstable_opts.force_unstable_if_unmarked {
-                        return EvalResult::Allow;
-                    }
+                if feature == sym::rustc_private
+                    && issue == NonZero::new(27812)
+                    && self.sess.opts.unstable_opts.force_unstable_if_unmarked
+                {
+                    return EvalResult::Allow;
                 }
 
                 if matches!(allow_unstable, AllowUnstable::Yes) {
@@ -507,7 +509,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     debug!("body stability: skipping span={:?} since it is internal", span);
                     return EvalResult::Allow;
                 }
-                if self.features().declared(feature) {
+                if self.features().enabled(feature) {
                     return EvalResult::Allow;
                 }
 

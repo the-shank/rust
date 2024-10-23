@@ -3,12 +3,14 @@
 
 use crate::intrinsics::{self, const_eval_select};
 
-/// Check that the preconditions of an unsafe function are followed. The check is enabled at
-/// runtime if debug assertions are enabled when the caller is monomorphized. In const-eval/Miri
-/// checks implemented with this macro for language UB are always ignored.
+/// Checks that the preconditions of an unsafe function are followed.
+///
+/// The check is enabled at runtime if debug assertions are enabled when the
+/// caller is monomorphized. In const-eval/Miri checks implemented with this
+/// macro for language UB are always ignored.
 ///
 /// This macro should be called as
-/// `assert_unsafe_precondition!(check_{library,lang}_ub, "message", (ident: type = expr, ident: type = expr) => check_expr)`
+/// `assert_unsafe_precondition!(check_{library,language}_ub, "message", (ident: type = expr, ident: type = expr) => check_expr)`
 /// where each `expr` will be evaluated and passed in as function argument `ident: type`. Then all
 /// those arguments are passed to a function with the body `check_expr`.
 /// Pick `check_language_ub` when this is guarding a violation of language UB, i.e., immediate UB
@@ -79,7 +81,6 @@ macro_rules! assert_unsafe_precondition {
 }
 #[unstable(feature = "ub_checks", issue = "none")]
 pub use assert_unsafe_precondition;
-
 /// Checking library UB is always enabled when UB-checking is done
 /// (and we use a reexport so that there is no unnecessary wrapper function).
 #[unstable(feature = "ub_checks", issue = "none")]
@@ -108,15 +109,15 @@ pub(crate) const fn check_language_ub() -> bool {
     intrinsics::ub_checks() && const_eval_select((), comptime, runtime)
 }
 
-/// Checks whether `ptr` is properly aligned with respect to
-/// `align_of::<T>()`.
+/// Checks whether `ptr` is properly aligned with respect to the given alignment, and
+/// if `is_zst == false`, that `ptr` is not null.
 ///
 /// In `const` this is approximate and can fail spuriously. It is primarily intended
 /// for `assert_unsafe_precondition!` with `check_language_ub`, in which case the
 /// check is anyway not executed in `const`.
 #[inline]
-pub(crate) const fn is_aligned_and_not_null(ptr: *const (), align: usize) -> bool {
-    !ptr.is_null() && ptr.is_aligned_to(align)
+pub(crate) const fn is_aligned_and_not_null(ptr: *const (), align: usize, is_zst: bool) -> bool {
+    ptr.is_aligned_to(align) && (is_zst || !ptr.is_null())
 }
 
 #[inline]

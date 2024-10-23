@@ -2,7 +2,7 @@
 
 mod format_like;
 
-use hir::{ImportPathConfig, ItemInNs};
+use hir::ItemInNs;
 use ide_db::{
     documentation::{Documentation, HasDocs},
     imports::insert_use::ImportScope,
@@ -60,10 +60,7 @@ pub(crate) fn complete_postfix(
         None => return,
     };
 
-    let cfg = ImportPathConfig {
-        prefer_no_std: ctx.config.prefer_no_std,
-        prefer_prelude: ctx.config.prefer_prelude,
-    };
+    let cfg = ctx.config.import_path_config();
 
     if let Some(drop_trait) = ctx.famous_defs().core_ops_Drop() {
         if receiver_ty.impls_trait(ctx.db, drop_trait, &[]) {
@@ -75,7 +72,10 @@ pub(crate) fn complete_postfix(
                     let mut item = postfix_snippet(
                         "drop",
                         "fn drop(&mut self)",
-                        &format!("{path}($0{receiver_text})", path = path.display(ctx.db)),
+                        &format!(
+                            "{path}($0{receiver_text})",
+                            path = path.display(ctx.db, ctx.edition)
+                        ),
                     );
                     item.set_documentation(drop_fn.docs(ctx.db));
                     item.add_to(acc, ctx.db);
@@ -294,6 +294,18 @@ fn include_references(initial_element: &ast::Expr) -> (ast::Expr, ast::Expr) {
 
     let mut new_element_opt = initial_element.clone();
 
+    while let Some(parent_deref_element) =
+        resulting_element.syntax().parent().and_then(ast::PrefixExpr::cast)
+    {
+        if parent_deref_element.op_kind() != Some(ast::UnaryOp::Deref) {
+            break;
+        }
+
+        resulting_element = ast::Expr::from(parent_deref_element);
+
+        new_element_opt = make::expr_prefix(syntax::T![*], new_element_opt);
+    }
+
     if let Some(first_ref_expr) = resulting_element.syntax().parent().and_then(ast::RefExpr::cast) {
         if let Some(expr) = first_ref_expr.expr() {
             resulting_element = expr;
@@ -302,9 +314,10 @@ fn include_references(initial_element: &ast::Expr) -> (ast::Expr, ast::Expr) {
         while let Some(parent_ref_element) =
             resulting_element.syntax().parent().and_then(ast::RefExpr::cast)
         {
+            let exclusive = parent_ref_element.mut_token().is_some();
             resulting_element = ast::Expr::from(parent_ref_element);
 
-            new_element_opt = make::expr_ref(new_element_opt, false);
+            new_element_opt = make::expr_ref(new_element_opt, exclusive);
         }
     } else {
         // If we do not find any ref expressions, restore
@@ -338,8 +351,12 @@ fn build_postfix_snippet_builder<'ctx>(
     ) -> impl Fn(&str, &str, &str) -> Builder + 'ctx {
         move |label, detail, snippet| {
             let edit = TextEdit::replace(delete_range, snippet.to_owned());
-            let mut item =
-                CompletionItem::new(CompletionItemKind::Snippet, ctx.source_range(), label);
+            let mut item = CompletionItem::new(
+                CompletionItemKind::Snippet,
+                ctx.source_range(),
+                label,
+                ctx.edition,
+            );
             item.detail(detail).snippet_edit(cap, edit);
             let postfix_match = if ctx.original_token.text() == label {
                 cov_mark::hit!(postfix_exact_match_is_high_priority);
@@ -668,7 +685,7 @@ fn main() {
         check_edit(
             "unsafe",
             r#"fn main() { let x = true else {panic!()}.$0}"#,
-            r#"fn main() { let x = true else {panic!()}.unsafe}"#,
+            r#"fn main() { let x = true else {panic!()}.unsafe $0}"#,
         );
     }
 
@@ -849,6 +866,44 @@ fn test() {
 }
 "#,
             expect![[r#""#]],
+        );
+    }
+
+    #[test]
+    fn mut_ref_consuming() {
+        check_edit(
+            "call",
+            r#"
+fn main() {
+    let mut x = &mut 2;
+    &mut x.$0;
+}
+"#,
+            r#"
+fn main() {
+    let mut x = &mut 2;
+    ${1}(&mut x);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn deref_consuming() {
+        check_edit(
+            "call",
+            r#"
+fn main() {
+    let mut x = &mut 2;
+    &mut *x.$0;
+}
+"#,
+            r#"
+fn main() {
+    let mut x = &mut 2;
+    ${1}(&mut *x);
+}
+"#,
         );
     }
 }

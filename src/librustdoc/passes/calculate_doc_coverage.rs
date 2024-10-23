@@ -1,23 +1,26 @@
 //! Calculates information used for the --show-coverage flag.
-use crate::clean;
-use crate::core::DocContext;
-use crate::html::markdown::{find_testable_code, ErrorCodes};
-use crate::passes::check_doc_test_visibility::{should_have_doc_example, Tests};
-use crate::passes::Pass;
-use crate::visit::DocVisitor;
+
+use std::collections::BTreeMap;
+use std::ops;
+
 use rustc_hir as hir;
 use rustc_lint::builtin::MISSING_DOCS;
 use rustc_middle::lint::LintLevelSource;
 use rustc_session::lint;
 use rustc_span::FileName;
 use serde::Serialize;
+use tracing::debug;
 
-use std::collections::BTreeMap;
-use std::ops;
+use crate::clean;
+use crate::core::DocContext;
+use crate::html::markdown::{ErrorCodes, find_testable_code};
+use crate::passes::Pass;
+use crate::passes::check_doc_test_visibility::{Tests, should_have_doc_example};
+use crate::visit::DocVisitor;
 
 pub(crate) const CALCULATE_DOC_COVERAGE: Pass = Pass {
     name: "calculate-doc-coverage",
-    run: calculate_doc_coverage,
+    run: Some(calculate_doc_coverage),
     description: "counts the number of items with and without documentation",
 };
 
@@ -184,7 +187,7 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
     }
 }
 
-impl<'a, 'b> DocVisitor for CoverageCalculator<'a, 'b> {
+impl<'a, 'b> DocVisitor<'_> for CoverageCalculator<'a, 'b> {
     fn visit_item(&mut self, i: &clean::Item) {
         if !i.item_id.is_local() {
             // non-local items are skipped because they can be out of the users control,
@@ -192,7 +195,7 @@ impl<'a, 'b> DocVisitor for CoverageCalculator<'a, 'b> {
             return;
         }
 
-        match *i.kind {
+        match i.kind {
             clean::StrippedItem(..) => {
                 // don't count items in stripped modules
                 return;

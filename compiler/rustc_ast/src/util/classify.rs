@@ -1,7 +1,8 @@
 //! Routines the parser and pretty-printer use to classify AST nodes.
 
 use crate::ast::ExprKind::*;
-use crate::{ast, token::Delimiter};
+use crate::ast::{self, MatchKind};
+use crate::token::Delimiter;
 
 /// This classification determines whether various syntactic positions break out
 /// of parsing the current expression (true) or continue parsing more of the
@@ -78,6 +79,82 @@ pub fn expr_requires_semi_to_be_stmt(e: &ast::Expr) -> bool {
     match &e.kind {
         MacCall(mac_call) => mac_call.args.delim != Delimiter::Brace,
         _ => !expr_is_complete(e),
+    }
+}
+
+/// Returns whether the leftmost token of the given expression is the label of a
+/// labeled loop or block, such as in `'inner: loop { break 'inner 1 } + 1`.
+///
+/// Such expressions are not allowed as the value of an unlabeled break.
+///
+/// ```ignore (illustrative)
+/// 'outer: {
+///     break 'inner: loop { break 'inner 1 } + 1;  // invalid syntax
+///
+///     break 'outer 'inner: loop { break 'inner 1 } + 1;  // okay
+///
+///     break ('inner: loop { break 'inner 1 } + 1);  // okay
+///
+///     break ('inner: loop { break 'inner 1 }) + 1;  // okay
+/// }
+/// ```
+pub fn leading_labeled_expr(mut expr: &ast::Expr) -> bool {
+    loop {
+        match &expr.kind {
+            Block(_, label) | ForLoop { label, .. } | Loop(_, label, _) | While(_, _, label) => {
+                return label.is_some();
+            }
+
+            Assign(e, _, _)
+            | AssignOp(_, e, _)
+            | Await(e, _)
+            | Binary(_, e, _)
+            | Call(e, _)
+            | Cast(e, _)
+            | Field(e, _)
+            | Index(e, _, _)
+            | Match(e, _, MatchKind::Postfix)
+            | Range(Some(e), _, _)
+            | Try(e) => {
+                expr = e;
+            }
+            MethodCall(method_call) => {
+                expr = &method_call.receiver;
+            }
+
+            AddrOf(..)
+            | Array(..)
+            | Become(..)
+            | Break(..)
+            | Closure(..)
+            | ConstBlock(..)
+            | Continue(..)
+            | FormatArgs(..)
+            | Gen(..)
+            | If(..)
+            | IncludedBytes(..)
+            | InlineAsm(..)
+            | Let(..)
+            | Lit(..)
+            | MacCall(..)
+            | Match(_, _, MatchKind::Prefix)
+            | OffsetOf(..)
+            | Paren(..)
+            | Path(..)
+            | Range(None, _, _)
+            | Repeat(..)
+            | Ret(..)
+            | Struct(..)
+            | TryBlock(..)
+            | Tup(..)
+            | Type(..)
+            | Unary(..)
+            | Underscore
+            | Yeet(..)
+            | Yield(..)
+            | Err(..)
+            | Dummy => return false,
+        }
     }
 }
 
@@ -170,7 +247,9 @@ fn type_trailing_braced_mac_call(mut ty: &ast::Ty) -> Option<&ast::MacCall> {
                 break (mac.args.delim == Delimiter::Brace).then_some(mac);
             }
 
-            ast::TyKind::Ptr(mut_ty) | ast::TyKind::Ref(_, mut_ty) => {
+            ast::TyKind::Ptr(mut_ty)
+            | ast::TyKind::Ref(_, mut_ty)
+            | ast::TyKind::PinnedRef(_, mut_ty) => {
                 ty = &mut_ty.ty;
             }
 
@@ -184,15 +263,17 @@ fn type_trailing_braced_mac_call(mut ty: &ast::Ty) -> Option<&ast::MacCall> {
                 None => break None,
             },
 
-            ast::TyKind::TraitObject(bounds, _) | ast::TyKind::ImplTrait(_, bounds, _) => {
+            ast::TyKind::TraitObject(bounds, _) | ast::TyKind::ImplTrait(_, bounds) => {
                 match bounds.last() {
-                    Some(ast::GenericBound::Trait(bound, _)) => {
+                    Some(ast::GenericBound::Trait(bound)) => {
                         match path_return_type(&bound.trait_ref.path) {
                             Some(trailing_ty) => ty = trailing_ty,
                             None => break None,
                         }
                     }
-                    Some(ast::GenericBound::Outlives(_)) | None => break None,
+                    Some(ast::GenericBound::Outlives(_) | ast::GenericBound::Use(..)) | None => {
+                        break None;
+                    }
                 }
             }
 
@@ -208,12 +289,6 @@ fn type_trailing_braced_mac_call(mut ty: &ast::Ty) -> Option<&ast::MacCall> {
             | ast::TyKind::Pat(..)
             | ast::TyKind::Dummy
             | ast::TyKind::Err(..) => break None,
-
-            // These end in brace, but cannot occur in a let-else statement.
-            // They are only parsed as fields of a data structure. For the
-            // purpose of denying trailing braces in the expression of a
-            // let-else, we can disregard these.
-            ast::TyKind::AnonStruct(..) | ast::TyKind::AnonUnion(..) => break None,
         }
     }
 }
@@ -232,6 +307,6 @@ fn path_return_type(path: &ast::Path) -> Option<&ast::Ty> {
             ast::FnRetTy::Default(_) => None,
             ast::FnRetTy::Ty(ret) => Some(ret),
         },
-        ast::GenericArgs::AngleBracketed(_) => None,
+        ast::GenericArgs::AngleBracketed(_) | ast::GenericArgs::ParenthesizedElided(_) => None,
     }
 }

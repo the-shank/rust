@@ -15,7 +15,7 @@ env:
   CARGO_NET_RETRY: 10
   CI: 1
   RUST_BACKTRACE: short
-  RUSTFLAGS: "-D warnings -W unreachable-pub -W bare-trait-objects"
+  RUSTFLAGS: "-D warnings -D elided_lifetimes_in_paths -D explicit_outlives_requirements -D unsafe_op_in_unsafe_fn -D unused_extern_crates -D unused_lifetimes -D unreachable_pub"
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
@@ -104,11 +104,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: target/${{ matrix.target }}/debug/rust-analyzer analysis-stats .
 
-      - name: Run analysis-stats on rust std library
+      - name: Run analysis-stats on the rust standard libraries
         if: matrix.os == 'ubuntu-latest'
         env:
-          RUSTC_BOOTSTRAP: 1
-        run: target/${{ matrix.target }}/debug/rust-analyzer analysis-stats --with-deps $(rustc --print sysroot)/lib/rustlib/src/rust/library/std
+            RUSTC_BOOTSTRAP: 1
+        run: target/${{ matrix.target }}/debug/rust-analyzer analysis-stats --with-deps --no-sysroot --no-test $(rustc --print sysroot)/lib/rustlib/src/rust/library/
 
       - name: clippy
         if: matrix.os == 'windows-latest'

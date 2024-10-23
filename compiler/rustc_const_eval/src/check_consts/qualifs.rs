@@ -5,15 +5,11 @@
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::LangItem;
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_middle::bug;
-use rustc_middle::mir;
 use rustc_middle::mir::*;
-use rustc_middle::traits::BuiltinImplSource;
 use rustc_middle::ty::{self, AdtDef, GenericArgsRef, Ty};
-use rustc_trait_selection::traits::{
-    ImplSource, Obligation, ObligationCause, ObligationCtxt, SelectionContext,
-};
-use tracing::{instrument, trace};
+use rustc_middle::{bug, mir};
+use rustc_trait_selection::traits::{Obligation, ObligationCause, ObligationCtxt};
+use tracing::instrument;
 
 use super::ConstCx;
 
@@ -100,7 +96,33 @@ impl Qualif for HasMutInterior {
     }
 
     fn in_any_value_of_ty<'tcx>(cx: &ConstCx<'_, 'tcx>, ty: Ty<'tcx>) -> bool {
-        !ty.is_freeze(cx.tcx, cx.param_env)
+        // Avoid selecting for simple cases, such as builtin types.
+        if ty.is_trivially_freeze() {
+            return false;
+        }
+
+        // We do not use `ty.is_freeze` here, because that requires revealing opaque types, which
+        // requires borrowck, which in turn will invoke mir_const_qualifs again, causing a cycle error.
+        // Instead we invoke an obligation context manually, and provide the opaque type inference settings
+        // that allow the trait solver to just error out instead of cycling.
+        let freeze_def_id = cx.tcx.require_lang_item(LangItem::Freeze, Some(cx.body.span));
+
+        let obligation = Obligation::new(
+            cx.tcx,
+            ObligationCause::dummy_with_span(cx.body.span),
+            cx.param_env,
+            ty::TraitRef::new(cx.tcx, freeze_def_id, [ty::GenericArg::from(ty)]),
+        );
+
+        let infcx = cx
+            .tcx
+            .infer_ctxt()
+            .with_opaque_type_inference(cx.body.source.def_id().expect_local())
+            .build();
+        let ocx = ObligationCtxt::new(&infcx);
+        ocx.register_obligation(obligation);
+        let errors = ocx.select_all_or_error();
+        !errors.is_empty()
     }
 
     fn in_adt_inherently<'tcx>(
@@ -170,54 +192,8 @@ impl Qualif for NeedsNonConstDrop {
             return false;
         }
 
-        // FIXME(effects): If `destruct` is not a `const_trait`,
-        // or effects are disabled in this crate, then give up.
-        let destruct_def_id = cx.tcx.require_lang_item(LangItem::Destruct, Some(cx.body.span));
-        if !cx.tcx.has_host_param(destruct_def_id) || !cx.tcx.features().effects {
-            return NeedsDrop::in_any_value_of_ty(cx, ty);
-        }
-
-        let obligation = Obligation::new(
-            cx.tcx,
-            ObligationCause::dummy_with_span(cx.body.span),
-            cx.param_env,
-            ty::TraitRef::new(
-                cx.tcx,
-                destruct_def_id,
-                [
-                    ty::GenericArg::from(ty),
-                    ty::GenericArg::from(cx.tcx.expected_host_effect_param_for_body(cx.def_id())),
-                ],
-            ),
-        );
-
-        let infcx = cx.tcx.infer_ctxt().build();
-        let mut selcx = SelectionContext::new(&infcx);
-        let Some(impl_src) = selcx.select(&obligation).ok().flatten() else {
-            // If we couldn't select a const destruct candidate, then it's bad
-            return true;
-        };
-
-        trace!(?impl_src);
-
-        if !matches!(
-            impl_src,
-            ImplSource::Builtin(BuiltinImplSource::Misc, _) | ImplSource::Param(_)
-        ) {
-            // If our const destruct candidate is not ConstDestruct or implied by the param env,
-            // then it's bad
-            return true;
-        }
-
-        if impl_src.borrow_nested_obligations().is_empty() {
-            return false;
-        }
-
-        // If we had any errors, then it's bad
-        let ocx = ObligationCtxt::new(&infcx);
-        ocx.register_obligations(impl_src.nested_obligations());
-        let errors = ocx.select_all_or_error();
-        !errors.is_empty()
+        // FIXME(effects): Reimplement const drop checking.
+        NeedsDrop::in_any_value_of_ty(cx, ty)
     }
 
     fn in_adt_inherently<'tcx>(
@@ -266,7 +242,7 @@ where
             in_operand::<Q, _>(cx, in_local, lhs) || in_operand::<Q, _>(cx, in_local, rhs)
         }
 
-        Rvalue::Ref(_, _, place) | Rvalue::AddressOf(_, place) => {
+        Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
             // Special-case reborrows to be more like a copy of the reference.
             if let Some((place_base, ProjectionElem::Deref)) = place.as_ref().last_projection() {
                 let base_ty = place_base.ty(cx.body, cx.tcx).ty;

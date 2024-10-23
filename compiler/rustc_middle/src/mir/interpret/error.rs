@@ -1,22 +1,22 @@
+use std::any::Any;
+use std::backtrace::Backtrace;
 use std::borrow::Cow;
-use std::{any::Any, backtrace::Backtrace, fmt};
+use std::{convert, fmt, mem, ops};
 
 use either::Either;
-
 use rustc_ast_ir::Mutability;
 use rustc_data_structures::sync::Lock;
 use rustc_errors::{DiagArgName, DiagArgValue, DiagMessage, ErrorGuaranteed, IntoDiagArg};
 use rustc_macros::{HashStable, TyDecodable, TyEncodable};
 use rustc_session::CtfeBacktrace;
-use rustc_span::Symbol;
-use rustc_span::{def_id::DefId, Span, DUMMY_SP};
-use rustc_target::abi::{call, Align, Size, VariantIdx, WrappingRange};
+use rustc_span::def_id::DefId;
+use rustc_span::{DUMMY_SP, Span, Symbol};
+use rustc_target::abi::{Align, Size, VariantIdx, WrappingRange, call};
 
 use super::{AllocId, AllocRange, ConstAllocation, Pointer, Scalar};
-
 use crate::error;
 use crate::mir::{ConstAlloc, ConstValue};
-use crate::ty::{self, layout, tls, Ty, TyCtxt, ValTree};
+use crate::ty::{self, Ty, TyCtxt, ValTree, layout, tls};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, HashStable, TyEncodable, TyDecodable)]
 pub enum ErrorHandled {
@@ -90,9 +90,11 @@ TrivialTypeTraversalImpls! { ErrorHandled }
 pub type EvalToAllocationRawResult<'tcx> = Result<ConstAlloc<'tcx>, ErrorHandled>;
 pub type EvalStaticInitializerRawResult<'tcx> = Result<ConstAllocation<'tcx>, ErrorHandled>;
 pub type EvalToConstValueResult<'tcx> = Result<ConstValue<'tcx>, ErrorHandled>;
-/// `Ok(None)` indicates the constant was fine, but the valtree couldn't be constructed.
-/// This is needed in `thir::pattern::lower_inline_const`.
-pub type EvalToValTreeResult<'tcx> = Result<Option<ValTree<'tcx>>, ErrorHandled>;
+/// `Ok(Err(ty))` indicates the constant was fine, but the valtree couldn't be constructed
+/// because the value contains something of type `ty` that is not valtree-compatible.
+/// The caller can then show an appropriate error; the query does not have the
+/// necessary context to give good user-facing errors for this case.
+pub type EvalToValTreeResult<'tcx> = Result<Result<ValTree<'tcx>, Ty<'tcx>>, ErrorHandled>;
 
 #[cfg(target_pointer_width = "64")]
 rustc_data_structures::static_assert_size!(InterpErrorInfo<'_>, 8);
@@ -102,12 +104,16 @@ rustc_data_structures::static_assert_size!(InterpErrorInfo<'_>, 8);
 /// These should always be constructed by calling `.into()` on
 /// an `InterpError`. In `rustc_mir::interpret`, we have `throw_err_*`
 /// macros for this.
+///
+/// Interpreter errors must *not* be silently discarded (that will lead to a panic). Instead,
+/// explicitly call `discard_err` if this is really the right thing to do. Note that if
+/// this happens during const-eval or in Miri, it could lead to a UB error being lost!
 #[derive(Debug)]
 pub struct InterpErrorInfo<'tcx>(Box<InterpErrorInfoInner<'tcx>>);
 
 #[derive(Debug)]
 struct InterpErrorInfoInner<'tcx> {
-    kind: InterpError<'tcx>,
+    kind: InterpErrorKind<'tcx>,
     backtrace: InterpErrorBacktrace,
 }
 
@@ -148,18 +154,21 @@ impl InterpErrorBacktrace {
 }
 
 impl<'tcx> InterpErrorInfo<'tcx> {
-    pub fn into_parts(self) -> (InterpError<'tcx>, InterpErrorBacktrace) {
+    pub fn into_parts(self) -> (InterpErrorKind<'tcx>, InterpErrorBacktrace) {
         let InterpErrorInfo(box InterpErrorInfoInner { kind, backtrace }) = self;
         (kind, backtrace)
     }
 
-    pub fn into_kind(self) -> InterpError<'tcx> {
-        let InterpErrorInfo(box InterpErrorInfoInner { kind, .. }) = self;
-        kind
+    pub fn into_kind(self) -> InterpErrorKind<'tcx> {
+        self.0.kind
+    }
+
+    pub fn from_parts(kind: InterpErrorKind<'tcx>, backtrace: InterpErrorBacktrace) -> Self {
+        Self(Box::new(InterpErrorInfoInner { kind, backtrace }))
     }
 
     #[inline]
-    pub fn kind(&self) -> &InterpError<'tcx> {
+    pub fn kind(&self) -> &InterpErrorKind<'tcx> {
         &self.0.kind
     }
 }
@@ -170,13 +179,13 @@ fn print_backtrace(backtrace: &Backtrace) {
 
 impl From<ErrorGuaranteed> for InterpErrorInfo<'_> {
     fn from(err: ErrorGuaranteed) -> Self {
-        InterpError::InvalidProgram(InvalidProgramInfo::AlreadyReported(err.into())).into()
+        InterpErrorKind::InvalidProgram(InvalidProgramInfo::AlreadyReported(err.into())).into()
     }
 }
 
 impl From<ErrorHandled> for InterpErrorInfo<'_> {
     fn from(err: ErrorHandled) -> Self {
-        InterpError::InvalidProgram(match err {
+        InterpErrorKind::InvalidProgram(match err {
             ErrorHandled::Reported(r, _span) => InvalidProgramInfo::AlreadyReported(r),
             ErrorHandled::TooGeneric(_span) => InvalidProgramInfo::TooGeneric,
         })
@@ -184,8 +193,8 @@ impl From<ErrorHandled> for InterpErrorInfo<'_> {
     }
 }
 
-impl<'tcx> From<InterpError<'tcx>> for InterpErrorInfo<'tcx> {
-    fn from(kind: InterpError<'tcx>) -> Self {
+impl<'tcx> From<InterpErrorKind<'tcx>> for InterpErrorInfo<'tcx> {
+    fn from(kind: InterpErrorKind<'tcx>) -> Self {
         InterpErrorInfo(Box::new(InterpErrorInfoInner {
             kind,
             backtrace: InterpErrorBacktrace::new(),
@@ -229,7 +238,7 @@ pub enum CheckInAllocMsg {
 pub enum CheckAlignMsg {
     /// The accessed pointer did not have proper alignment.
     AccessedPtr,
-    /// The access ocurred with a place that was based on a misaligned pointer.
+    /// The access occurred with a place that was based on a misaligned pointer.
     BasedOn,
 }
 
@@ -327,16 +336,22 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     /// Using a pointer after it got freed.
     PointerUseAfterFree(AllocId, CheckInAllocMsg),
     /// Used a pointer outside the bounds it is valid for.
-    /// (If `ptr_size > 0`, determines the size of the memory range that was expected to be in-bounds.)
     PointerOutOfBounds {
         alloc_id: AllocId,
         alloc_size: Size,
         ptr_offset: i64,
-        ptr_size: Size,
+        /// The size of the memory range that was expected to be in-bounds.
+        inbounds_size: i64,
         msg: CheckInAllocMsg,
     },
     /// Using an integer as a pointer in the wrong way.
-    DanglingIntPointer(u64, CheckInAllocMsg),
+    DanglingIntPointer {
+        addr: u64,
+        /// The size of the memory range that was expected to be in-bounds (or 0 if we need an
+        /// allocation but not any actual memory there, e.g. for function pointers).
+        inbounds_size: i64,
+        msg: CheckInAllocMsg,
+    },
     /// Used a pointer with bad alignment.
     AlignmentCheckFailed(Misalignment, CheckAlignMsg),
     /// Writing to read-only memory.
@@ -357,8 +372,10 @@ pub enum UndefinedBehaviorInfo<'tcx> {
     InvalidVTablePointer(Pointer<AllocId>),
     /// Using a vtable for the wrong trait.
     InvalidVTableTrait {
-        expected_trait: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
-        vtable_trait: Option<ty::PolyExistentialTraitRef<'tcx>>,
+        /// The vtable that was actually referenced by the wide pointer metadata.
+        vtable_dyn_type: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
+        /// The vtable that was expected at the point in MIR that it was accessed.
+        expected_dyn_type: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
     },
     /// Using a string that is not valid UTF-8,
     InvalidStr(std::str::Utf8Error),
@@ -438,9 +455,6 @@ pub enum ValidationErrorKind<'tcx> {
         ptr_kind: PointerKind,
         ty: Ty<'tcx>,
     },
-    PtrToStatic {
-        ptr_kind: PointerKind,
-    },
     ConstRefToMutable,
     ConstRefToExtern,
     MutableRefToImmutable,
@@ -474,8 +488,10 @@ pub enum ValidationErrorKind<'tcx> {
         value: String,
     },
     InvalidMetaWrongTrait {
-        expected_trait: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
-        vtable_trait: Option<ty::PolyExistentialTraitRef<'tcx>>,
+        /// The vtable that was actually referenced by the wide pointer metadata.
+        vtable_dyn_type: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
+        /// The vtable that was expected at the point in MIR that it was accessed.
+        expected_dyn_type: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
     },
     InvalidMetaSliceTooLarge {
         ptr_kind: PointerKind,
@@ -523,6 +539,8 @@ pub enum UnsupportedOpInfo {
     Unsupported(String),
     /// Unsized local variables.
     UnsizedLocal,
+    /// Extern type field with an indeterminate offset.
+    ExternTypeField,
     //
     // The variants below are only reachable from CTFE/const prop, miri will never emit them.
     //
@@ -572,7 +590,7 @@ impl dyn MachineStopType {
 }
 
 #[derive(Debug)]
-pub enum InterpError<'tcx> {
+pub enum InterpErrorKind<'tcx> {
     /// The program caused undefined behavior.
     UndefinedBehavior(UndefinedBehaviorInfo<'tcx>),
     /// The program did something the interpreter does not support (some of these *might* be UB
@@ -588,27 +606,25 @@ pub enum InterpError<'tcx> {
     MachineStop(Box<dyn MachineStopType>),
 }
 
-pub type InterpResult<'tcx, T = ()> = Result<T, InterpErrorInfo<'tcx>>;
-
-impl InterpError<'_> {
+impl InterpErrorKind<'_> {
     /// Some errors do string formatting even if the error is never printed.
     /// To avoid performance issues, there are places where we want to be sure to never raise these formatting errors,
     /// so this method lets us detect them and `bug!` on unexpected errors.
     pub fn formatted_string(&self) -> bool {
         matches!(
             self,
-            InterpError::Unsupported(UnsupportedOpInfo::Unsupported(_))
-                | InterpError::UndefinedBehavior(UndefinedBehaviorInfo::ValidationError { .. })
-                | InterpError::UndefinedBehavior(UndefinedBehaviorInfo::Ub(_))
+            InterpErrorKind::Unsupported(UnsupportedOpInfo::Unsupported(_))
+                | InterpErrorKind::UndefinedBehavior(UndefinedBehaviorInfo::ValidationError { .. })
+                | InterpErrorKind::UndefinedBehavior(UndefinedBehaviorInfo::Ub(_))
         )
     }
 }
 
-// Macros for constructing / throwing `InterpError`
+// Macros for constructing / throwing `InterpErrorKind`
 #[macro_export]
 macro_rules! err_unsup {
     ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::Unsupported(
+        $crate::mir::interpret::InterpErrorKind::Unsupported(
             $crate::mir::interpret::UnsupportedOpInfo::$($tt)*
         )
     };
@@ -622,7 +638,7 @@ macro_rules! err_unsup_format {
 #[macro_export]
 macro_rules! err_inval {
     ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::InvalidProgram(
+        $crate::mir::interpret::InterpErrorKind::InvalidProgram(
             $crate::mir::interpret::InvalidProgramInfo::$($tt)*
         )
     };
@@ -631,7 +647,7 @@ macro_rules! err_inval {
 #[macro_export]
 macro_rules! err_ub {
     ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::UndefinedBehavior(
+        $crate::mir::interpret::InterpErrorKind::UndefinedBehavior(
             $crate::mir::interpret::UndefinedBehaviorInfo::$($tt)*
         )
     };
@@ -664,7 +680,7 @@ macro_rules! err_ub_custom {
 #[macro_export]
 macro_rules! err_exhaust {
     ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::ResourceExhaustion(
+        $crate::mir::interpret::InterpErrorKind::ResourceExhaustion(
             $crate::mir::interpret::ResourceExhaustionInfo::$($tt)*
         )
     };
@@ -673,7 +689,7 @@ macro_rules! err_exhaust {
 #[macro_export]
 macro_rules! err_machine_stop {
     ($($tt:tt)*) => {
-        $crate::mir::interpret::InterpError::MachineStop(Box::new($($tt)*))
+        $crate::mir::interpret::InterpErrorKind::MachineStop(Box::new($($tt)*))
     };
 }
 
@@ -716,4 +732,195 @@ macro_rules! throw_exhaust {
 #[macro_export]
 macro_rules! throw_machine_stop {
     ($($tt:tt)*) => { do yeet $crate::err_machine_stop!($($tt)*) };
+}
+
+/// Guard type that panics on drop.
+#[derive(Debug)]
+struct Guard;
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        // We silence the guard if we are already panicking, to avoid double-panics.
+        if !std::thread::panicking() {
+            panic!(
+                "an interpreter error got improperly discarded; use `discard_err()` if this is intentional"
+            );
+        }
+    }
+}
+
+/// The result type used by the interpreter. This is a newtype around `Result`
+/// to block access to operations like `ok()` that discard UB errors.
+///
+/// We also make things panic if this type is ever implicitly dropped.
+#[derive(Debug)]
+#[must_use]
+pub struct InterpResult_<'tcx, T> {
+    res: Result<T, InterpErrorInfo<'tcx>>,
+    guard: Guard,
+}
+
+// Type alias to be able to set a default type argument.
+pub type InterpResult<'tcx, T = ()> = InterpResult_<'tcx, T>;
+
+impl<'tcx, T> ops::Try for InterpResult_<'tcx, T> {
+    type Output = T;
+    type Residual = InterpResult_<'tcx, convert::Infallible>;
+
+    #[inline]
+    fn from_output(output: Self::Output) -> Self {
+        InterpResult_::new(Ok(output))
+    }
+
+    #[inline]
+    fn branch(self) -> ops::ControlFlow<Self::Residual, Self::Output> {
+        match self.disarm() {
+            Ok(v) => ops::ControlFlow::Continue(v),
+            Err(e) => ops::ControlFlow::Break(InterpResult_::new(Err(e))),
+        }
+    }
+}
+
+impl<'tcx, T> ops::FromResidual for InterpResult_<'tcx, T> {
+    #[inline]
+    #[track_caller]
+    fn from_residual(residual: InterpResult_<'tcx, convert::Infallible>) -> Self {
+        match residual.disarm() {
+            Err(e) => Self::new(Err(e)),
+        }
+    }
+}
+
+// Allow `yeet`ing `InterpError` in functions returning `InterpResult_`.
+impl<'tcx, T> ops::FromResidual<ops::Yeet<InterpErrorKind<'tcx>>> for InterpResult_<'tcx, T> {
+    #[inline]
+    fn from_residual(ops::Yeet(e): ops::Yeet<InterpErrorKind<'tcx>>) -> Self {
+        Self::new(Err(e.into()))
+    }
+}
+
+// Allow `?` on `Result<_, InterpError>` in functions returning `InterpResult_`.
+// This is useful e.g. for `option.ok_or_else(|| err_ub!(...))`.
+impl<'tcx, T, E: Into<InterpErrorInfo<'tcx>>> ops::FromResidual<Result<convert::Infallible, E>>
+    for InterpResult_<'tcx, T>
+{
+    #[inline]
+    fn from_residual(residual: Result<convert::Infallible, E>) -> Self {
+        match residual {
+            Err(e) => Self::new(Err(e.into())),
+        }
+    }
+}
+
+impl<'tcx, T, E: Into<InterpErrorInfo<'tcx>>> From<Result<T, E>> for InterpResult<'tcx, T> {
+    #[inline]
+    fn from(value: Result<T, E>) -> Self {
+        Self::new(value.map_err(|e| e.into()))
+    }
+}
+
+impl<'tcx, T, V: FromIterator<T>> FromIterator<InterpResult<'tcx, T>> for InterpResult<'tcx, V> {
+    fn from_iter<I: IntoIterator<Item = InterpResult<'tcx, T>>>(iter: I) -> Self {
+        Self::new(iter.into_iter().map(|x| x.disarm()).collect())
+    }
+}
+
+impl<'tcx, T> InterpResult_<'tcx, T> {
+    #[inline(always)]
+    fn new(res: Result<T, InterpErrorInfo<'tcx>>) -> Self {
+        Self { res, guard: Guard }
+    }
+
+    #[inline(always)]
+    fn disarm(self) -> Result<T, InterpErrorInfo<'tcx>> {
+        mem::forget(self.guard);
+        self.res
+    }
+
+    /// Discard the error information in this result. Only use this if ignoring Undefined Behavior is okay!
+    #[inline]
+    pub fn discard_err(self) -> Option<T> {
+        self.disarm().ok()
+    }
+
+    /// Look at the `Result` wrapped inside of this.
+    /// Must only be used to report the error!
+    #[inline]
+    pub fn report_err(self) -> Result<T, InterpErrorInfo<'tcx>> {
+        self.disarm()
+    }
+
+    #[inline]
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> InterpResult<'tcx, U> {
+        InterpResult_::new(self.disarm().map(f))
+    }
+
+    #[inline]
+    pub fn map_err_info(
+        self,
+        f: impl FnOnce(InterpErrorInfo<'tcx>) -> InterpErrorInfo<'tcx>,
+    ) -> InterpResult<'tcx, T> {
+        InterpResult_::new(self.disarm().map_err(f))
+    }
+
+    #[inline]
+    pub fn map_err_kind(
+        self,
+        f: impl FnOnce(InterpErrorKind<'tcx>) -> InterpErrorKind<'tcx>,
+    ) -> InterpResult<'tcx, T> {
+        InterpResult_::new(self.disarm().map_err(|mut e| {
+            e.0.kind = f(e.0.kind);
+            e
+        }))
+    }
+
+    #[inline]
+    pub fn inspect_err_kind(self, f: impl FnOnce(&InterpErrorKind<'tcx>)) -> InterpResult<'tcx, T> {
+        InterpResult_::new(self.disarm().inspect_err(|e| f(&e.0.kind)))
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn unwrap(self) -> T {
+        self.disarm().unwrap()
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn unwrap_or_else(self, f: impl FnOnce(InterpErrorInfo<'tcx>) -> T) -> T {
+        self.disarm().unwrap_or_else(f)
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn expect(self, msg: &str) -> T {
+        self.disarm().expect(msg)
+    }
+
+    #[inline]
+    pub fn and_then<U>(self, f: impl FnOnce(T) -> InterpResult<'tcx, U>) -> InterpResult<'tcx, U> {
+        InterpResult_::new(self.disarm().and_then(|t| f(t).disarm()))
+    }
+
+    /// Returns success if both `self` and `other` succeed, while ensuring we don't
+    /// accidentally drop an error.
+    ///
+    /// If both are an error, `self` will be reported.
+    #[inline]
+    pub fn and<U>(self, other: InterpResult<'tcx, U>) -> InterpResult<'tcx, (T, U)> {
+        match self.disarm() {
+            Ok(t) => interp_ok((t, other?)),
+            Err(e) => {
+                // Discard the other error.
+                drop(other.disarm());
+                // Return `self`.
+                InterpResult_::new(Err(e))
+            }
+        }
+    }
+}
+
+#[inline(always)]
+pub fn interp_ok<'tcx, T>(x: T) -> InterpResult<'tcx, T> {
+    InterpResult_::new(Ok(x))
 }

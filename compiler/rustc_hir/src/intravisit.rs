@@ -64,12 +64,13 @@
 //! This order consistency is required in a few places in rustc, for
 //! example coroutine inference, and possibly also HIR borrowck.
 
-use crate::hir::*;
-use rustc_ast::visit::{try_visit, visit_opt, walk_list, VisitorResult};
+use rustc_ast::visit::{VisitorResult, try_visit, visit_opt, walk_list};
 use rustc_ast::{Attribute, Label};
+use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::{Ident, Symbol};
-use rustc_span::Span;
+
+use crate::hir::*;
 
 pub trait IntoVisitor<'hir> {
     type Visitor: Visitor<'hir>;
@@ -110,6 +111,7 @@ impl<'a> FnKind<'a> {
 pub trait Map<'hir> {
     /// Retrieves the `Node` corresponding to `id`.
     fn hir_node(&self, hir_id: HirId) -> Node<'hir>;
+    fn hir_node_by_def_id(&self, def_id: LocalDefId) -> Node<'hir>;
     fn body(&self, id: BodyId) -> &'hir Body<'hir>;
     fn item(&self, id: ItemId) -> &'hir Item<'hir>;
     fn trait_item(&self, id: TraitItemId) -> &'hir TraitItem<'hir>;
@@ -120,6 +122,9 @@ pub trait Map<'hir> {
 // Used when no map is actually available, forcing manual implementation of nested visitors.
 impl<'hir> Map<'hir> for ! {
     fn hir_node(&self, _: HirId) -> Node<'hir> {
+        *self;
+    }
+    fn hir_node_by_def_id(&self, _: LocalDefId) -> Node<'hir> {
         *self;
     }
     fn body(&self, _: BodyId) -> &'hir Body<'hir> {
@@ -347,6 +352,9 @@ pub trait Visitor<'v>: Sized {
     fn visit_inline_const(&mut self, c: &'v ConstBlock) -> Self::Result {
         walk_inline_const(self, c)
     }
+    fn visit_const_arg(&mut self, c: &'v ConstArg<'v>) -> Self::Result {
+        walk_const_arg(self, c)
+    }
     fn visit_expr(&mut self, ex: &'v Expr<'v>) -> Self::Result {
         walk_expr(self, ex)
     }
@@ -364,7 +372,7 @@ pub trait Visitor<'v>: Sized {
     fn visit_generic_param(&mut self, p: &'v GenericParam<'v>) -> Self::Result {
         walk_generic_param(self, p)
     }
-    fn visit_const_param_default(&mut self, _param: HirId, ct: &'v AnonConst) -> Self::Result {
+    fn visit_const_param_default(&mut self, _param: HirId, ct: &'v ConstArg<'v>) -> Self::Result {
         walk_const_param_default(self, ct)
     }
     fn visit_generics(&mut self, g: &'v Generics<'v>) -> Self::Result {
@@ -418,6 +426,9 @@ pub trait Visitor<'v>: Sized {
     }
     fn visit_poly_trait_ref(&mut self, t: &'v PolyTraitRef<'v>) -> Self::Result {
         walk_poly_trait_ref(self, t)
+    }
+    fn visit_opaque_ty(&mut self, opaque: &'v OpaqueTy<'v>) -> Self::Result {
+        walk_opaque_ty(self, opaque)
     }
     fn visit_variant_data(&mut self, s: &'v VariantData<'v>) -> Self::Result {
         walk_struct_def(self, s)
@@ -532,22 +543,13 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item<'v>) -> V::
             try_visit!(visitor.visit_ty(ty));
             try_visit!(visitor.visit_generics(generics));
         }
-        ItemKind::OpaqueTy(&OpaqueTy { generics, bounds, precise_capturing_args, .. }) => {
-            try_visit!(visitor.visit_id(item.hir_id()));
-            try_visit!(walk_generics(visitor, generics));
-            walk_list!(visitor, visit_param_bound, bounds);
-            if let Some((precise_capturing_args, _)) = precise_capturing_args {
-                for arg in precise_capturing_args {
-                    try_visit!(visitor.visit_precise_capturing_arg(arg));
-                }
-            }
-        }
         ItemKind::Enum(ref enum_definition, ref generics) => {
             try_visit!(visitor.visit_generics(generics));
             // `visit_enum_def()` takes care of visiting the `Item`'s `HirId`.
             try_visit!(visitor.visit_enum_def(enum_definition, item.hir_id()));
         }
         ItemKind::Impl(Impl {
+            constness: _,
             safety: _,
             defaultness: _,
             polarity: _,
@@ -611,9 +613,9 @@ pub fn walk_foreign_item<'v, V: Visitor<'v>>(
     try_visit!(visitor.visit_ident(foreign_item.ident));
 
     match foreign_item.kind {
-        ForeignItemKind::Fn(ref function_declaration, param_names, ref generics, _) => {
+        ForeignItemKind::Fn(ref sig, param_names, ref generics) => {
             try_visit!(visitor.visit_generics(generics));
-            try_visit!(visitor.visit_fn_decl(function_declaration));
+            try_visit!(visitor.visit_fn_decl(sig.decl));
             walk_list!(visitor, visit_ident, param_names.iter().copied());
         }
         ForeignItemKind::Static(ref typ, _, _) => {
@@ -712,7 +714,7 @@ pub fn walk_array_len<'v, V: Visitor<'v>>(visitor: &mut V, len: &'v ArrayLen<'v>
     match len {
         // FIXME: Use `visit_infer` here.
         ArrayLen::Infer(InferArg { hir_id, span: _ }) => visitor.visit_id(*hir_id),
-        ArrayLen::Body(c) => visitor.visit_anon_const(c),
+        ArrayLen::Body(c) => visitor.visit_const_arg(c),
     }
 }
 
@@ -727,6 +729,17 @@ pub fn walk_inline_const<'v, V: Visitor<'v>>(
 ) -> V::Result {
     try_visit!(visitor.visit_id(constant.hir_id));
     visitor.visit_nested_body(constant.body)
+}
+
+pub fn walk_const_arg<'v, V: Visitor<'v>>(
+    visitor: &mut V,
+    const_arg: &'v ConstArg<'v>,
+) -> V::Result {
+    try_visit!(visitor.visit_id(const_arg.hir_id));
+    match &const_arg.kind {
+        ConstArgKind::Path(qpath) => visitor.visit_qpath(qpath, const_arg.hir_id, qpath.span()),
+        ConstArgKind::Anon(anon) => visitor.visit_anon_const(*anon),
+    }
 }
 
 pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr<'v>) -> V::Result {
@@ -883,8 +896,8 @@ pub fn walk_ty<'v, V: Visitor<'v>>(visitor: &mut V, typ: &'v Ty<'v>) -> V::Resul
         TyKind::Path(ref qpath) => {
             try_visit!(visitor.visit_qpath(qpath, typ.hir_id, typ.span));
         }
-        TyKind::OpaqueDef(item_id, lifetimes, _in_trait) => {
-            try_visit!(visitor.visit_nested_item(item_id));
+        TyKind::OpaqueDef(opaque, lifetimes) => {
+            try_visit!(visitor.visit_opaque_ty(opaque));
             walk_list!(visitor, visit_generic_arg, lifetimes);
         }
         TyKind::Array(ref ty, ref length) => {
@@ -892,7 +905,9 @@ pub fn walk_ty<'v, V: Visitor<'v>>(visitor: &mut V, typ: &'v Ty<'v>) -> V::Resul
             try_visit!(visitor.visit_array_length(length));
         }
         TyKind::TraitObject(bounds, ref lifetime, _syntax) => {
-            walk_list!(visitor, visit_poly_trait_ref, bounds);
+            for bound in bounds {
+                try_visit!(visitor.visit_poly_trait_ref(bound));
+            }
             try_visit!(visitor.visit_lifetime(lifetime));
         }
         TyKind::Typeof(ref expression) => try_visit!(visitor.visit_anon_const(expression)),
@@ -920,7 +935,7 @@ pub fn walk_generic_param<'v, V: Visitor<'v>>(
     match param.kind {
         GenericParamKind::Lifetime { .. } => {}
         GenericParamKind::Type { ref default, .. } => visit_opt!(visitor, visit_ty, default),
-        GenericParamKind::Const { ref ty, ref default, is_host_effect: _ } => {
+        GenericParamKind::Const { ref ty, ref default, is_host_effect: _, synthetic: _ } => {
             try_visit!(visitor.visit_ty(ty));
             if let Some(ref default) = default {
                 try_visit!(visitor.visit_const_param_default(param.hir_id, default));
@@ -932,9 +947,9 @@ pub fn walk_generic_param<'v, V: Visitor<'v>>(
 
 pub fn walk_const_param_default<'v, V: Visitor<'v>>(
     visitor: &mut V,
-    ct: &'v AnonConst,
+    ct: &'v ConstArg<'v>,
 ) -> V::Result {
-    visitor.visit_anon_const(ct)
+    visitor.visit_const_arg(ct)
 }
 
 pub fn walk_generics<'v, V: Visitor<'v>>(visitor: &mut V, generics: &'v Generics<'v>) -> V::Result {
@@ -1145,8 +1160,12 @@ pub fn walk_param_bound<'v, V: Visitor<'v>>(
     bound: &'v GenericBound<'v>,
 ) -> V::Result {
     match *bound {
-        GenericBound::Trait(ref typ, _modifier) => visitor.visit_poly_trait_ref(typ),
+        GenericBound::Trait(ref typ) => visitor.visit_poly_trait_ref(typ),
         GenericBound::Outlives(ref lifetime) => visitor.visit_lifetime(lifetime),
+        GenericBound::Use(args, _) => {
+            walk_list!(visitor, visit_precise_capturing_arg, args);
+            V::Result::output()
+        }
     }
 }
 
@@ -1166,6 +1185,15 @@ pub fn walk_poly_trait_ref<'v, V: Visitor<'v>>(
 ) -> V::Result {
     walk_list!(visitor, visit_generic_param, trait_ref.bound_generic_params);
     visitor.visit_trait_ref(&trait_ref.trait_ref)
+}
+
+pub fn walk_opaque_ty<'v, V: Visitor<'v>>(visitor: &mut V, opaque: &'v OpaqueTy<'v>) -> V::Result {
+    let &OpaqueTy { hir_id, def_id: _, generics, bounds, origin: _, lifetime_mapping: _, span: _ } =
+        opaque;
+    try_visit!(visitor.visit_id(hir_id));
+    try_visit!(walk_generics(visitor, generics));
+    walk_list!(visitor, visit_param_bound, bounds);
+    V::Result::output()
 }
 
 pub fn walk_struct_def<'v, V: Visitor<'v>>(
@@ -1216,7 +1244,7 @@ pub fn walk_generic_arg<'v, V: Visitor<'v>>(
     match generic_arg {
         GenericArg::Lifetime(lt) => visitor.visit_lifetime(lt),
         GenericArg::Type(ty) => visitor.visit_ty(ty),
-        GenericArg::Const(ct) => visitor.visit_anon_const(&ct.value),
+        GenericArg::Const(ct) => visitor.visit_const_arg(ct),
         GenericArg::Infer(inf) => visitor.visit_infer(inf),
     }
 }
@@ -1278,7 +1306,7 @@ pub fn walk_assoc_item_constraint<'v, V: Visitor<'v>>(
     match constraint.kind {
         AssocItemConstraintKind::Equality { ref term } => match term {
             Term::Ty(ref ty) => try_visit!(visitor.visit_ty(ty)),
-            Term::Const(ref c) => try_visit!(visitor.visit_anon_const(c)),
+            Term::Const(ref c) => try_visit!(visitor.visit_const_arg(c)),
         },
         AssocItemConstraintKind::Bound { bounds } => {
             walk_list!(visitor, visit_param_bound, bounds)

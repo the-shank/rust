@@ -1,17 +1,15 @@
 use std::ffi::OsStr;
-use std::io;
-use std::iter;
 use std::path::{self, Path, PathBuf};
-use std::str;
+use std::{io, iter, str};
 
 use rustc_span::Symbol;
 use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi;
 
+use self::shims::windows::handle::{Handle, PseudoHandle};
 use crate::shims::os_str::bytes_to_os_str;
 use crate::shims::windows::*;
 use crate::*;
-use shims::windows::handle::{Handle, PseudoHandle};
 
 pub fn is_dyn_sym(name: &str) -> bool {
     // std does dynamic detection for these symbols
@@ -23,8 +21,8 @@ pub fn is_dyn_sym(name: &str) -> bool {
 
 #[cfg(windows)]
 fn win_absolute<'tcx>(path: &Path) -> InterpResult<'tcx, io::Result<PathBuf>> {
-    // We are on Windows so we can simply lte the host do this.
-    return Ok(path::absolute(path));
+    // We are on Windows so we can simply let the host do this.
+    interp_ok(path::absolute(path))
 }
 
 #[cfg(unix)]
@@ -35,7 +33,7 @@ fn win_absolute<'tcx>(path: &Path) -> InterpResult<'tcx, io::Result<PathBuf>> {
     // If it starts with `//` (these were backslashes but are already converted)
     // then this is a magic special path, we just leave it unchanged.
     if bytes.get(0).copied() == Some(b'/') && bytes.get(1).copied() == Some(b'/') {
-        return Ok(Ok(path.into()));
+        return interp_ok(Ok(path.into()));
     };
     // Special treatment for Windows' magic filenames: they are treated as being relative to `\\.\`.
     let magic_filenames = &[
@@ -45,7 +43,7 @@ fn win_absolute<'tcx>(path: &Path) -> InterpResult<'tcx, io::Result<PathBuf>> {
     if magic_filenames.iter().any(|m| m.as_bytes() == bytes) {
         let mut result: Vec<u8> = br"//./".into();
         result.extend(bytes);
-        return Ok(Ok(bytes_to_os_str(&result)?.into()));
+        return interp_ok(Ok(bytes_to_os_str(&result)?.into()));
     }
     // Otherwise we try to do something kind of close to what Windows does, but this is probably not
     // right in all cases. We iterate over the components between `/`, and remove trailing `.`,
@@ -73,7 +71,7 @@ fn win_absolute<'tcx>(path: &Path) -> InterpResult<'tcx, io::Result<PathBuf>> {
         }
     }
     // Let the host `absolute` function do working-dir handling
-    Ok(path::absolute(bytes_to_os_str(&result)?))
+    interp_ok(path::absolute(bytes_to_os_str(&result)?))
 }
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
@@ -136,6 +134,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let [token, buf, size] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let result = this.GetUserProfileDirectoryW(token, buf, size)?;
+                this.write_scalar(result, dest)?;
+            }
+            "GetCurrentProcessId" => {
+                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                let result = this.GetCurrentProcessId()?;
                 this.write_scalar(result, dest)?;
             }
 
@@ -224,7 +227,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let filename = this.read_path_from_wide_str(filename)?;
                 let result = match win_absolute(&filename)? {
                     Err(err) => {
-                        this.set_last_error_from_io_error(err)?;
+                        this.set_last_error(err)?;
                         Scalar::from_u32(0) // return zero upon failure
                     }
                     Ok(abs_filename) => {
@@ -367,7 +370,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.machine.tls.store_tls(key, active_thread, new_data, &*this.tcx)?;
 
                 // Return success (`1`).
-                this.write_scalar(Scalar::from_i32(1), dest)?;
+                this.write_int(1, dest)?;
             }
 
             // Access to command-line arguments
@@ -558,7 +561,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let ptr = this.read_pointer(ptr)?;
                 let len = this.read_target_usize(len)?;
                 this.gen_random(ptr, len)?;
-                this.write_scalar(Scalar::from_i32(1), dest)?;
+                this.write_int(1, dest)?;
             }
             "BCryptGenRandom" => {
                 // used by getrandom 0.2
@@ -622,7 +625,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
                 this.CloseHandle(handle)?;
 
-                this.write_scalar(Scalar::from_u32(1), dest)?;
+                this.write_int(1, dest)?;
             }
             "GetModuleFileNameW" => {
                 let [handle, filename, size] =
@@ -647,7 +650,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     // If the function succeeds, the return value is the length of the string that
                     // is copied to the buffer, in characters, not including the terminating null
                     // character.
-                    this.write_int(size_needed.checked_sub(1).unwrap(), dest)?;
+                    this.write_int(size_needed.strict_sub(1), dest)?;
                 } else {
                     // If the buffer is too small to hold the module name, the string is truncated
                     // to nSize characters including the terminating null character, the function
@@ -689,7 +692,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     throw_unsup_format!("FormatMessageW: buffer not big enough");
                 }
                 // The return value is the number of characters stored *excluding* the null terminator.
-                this.write_int(length.checked_sub(1).unwrap(), dest)?;
+                this.write_int(length.strict_sub(1), dest)?;
             }
 
             // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
@@ -743,11 +746,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // Any non zero value works for the stdlib. This is just used for stack overflows anyway.
                 this.write_int(1, dest)?;
             }
-            "GetCurrentProcessId" if this.frame_in_std() => {
-                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                let result = this.GetCurrentProcessId()?;
-                this.write_int(result, dest)?;
-            }
             // this is only callable from std because we know that std ignores the return value
             "SwitchToThread" if this.frame_in_std() => {
                 let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
@@ -758,9 +756,25 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_null(dest)?;
             }
 
-            _ => return Ok(EmulateItemResult::NotSupported),
+            "_Unwind_RaiseException" => {
+                // This is not formally part of POSIX, but it is very wide-spread on POSIX systems.
+                // It was originally specified as part of the Itanium C++ ABI:
+                // https://itanium-cxx-abi.github.io/cxx-abi/abi-eh.html#base-throw.
+                // MinGW implements _Unwind_RaiseException on top of SEH exceptions.
+                if this.tcx.sess.target.env != "gnu" {
+                    throw_unsup_format!(
+                        "`_Unwind_RaiseException` is not supported on non-MinGW Windows",
+                    );
+                }
+                // This function looks and behaves excatly like miri_start_unwind.
+                let [payload] = this.check_shim(abi, Abi::C { unwind: true }, link_name, args)?;
+                this.handle_miri_start_unwind(payload)?;
+                return interp_ok(EmulateItemResult::NeedsUnwind);
+            }
+
+            _ => return interp_ok(EmulateItemResult::NotSupported),
         }
 
-        Ok(EmulateItemResult::NeedsReturn)
+        interp_ok(EmulateItemResult::NeedsReturn)
     }
 }

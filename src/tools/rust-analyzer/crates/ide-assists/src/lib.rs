@@ -58,7 +58,7 @@
 //! See also this post:
 //! <https://rust-analyzer.github.io/blog/2020/09/28/how-to-make-a-light-bulb.html>
 
-#![warn(rust_2018_idioms, unused_lifetimes)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
 mod assist_config;
 mod assist_context;
@@ -67,7 +67,7 @@ mod tests;
 pub mod utils;
 
 use hir::Semantics;
-use ide_db::{base_db::FileRange, RootDatabase};
+use ide_db::{EditionedFileId, RootDatabase};
 use syntax::TextRange;
 
 pub(crate) use crate::assist_context::{AssistContext, Assists};
@@ -85,10 +85,13 @@ pub fn assists(
     db: &RootDatabase,
     config: &AssistConfig,
     resolve: AssistResolveStrategy,
-    range: FileRange,
+    range: ide_db::FileRange,
 ) -> Vec<Assist> {
     let sema = Semantics::new(db);
-    let ctx = AssistContext::new(sema, config, range);
+    let file_id = sema
+        .attach_first_edition(range.file_id)
+        .unwrap_or_else(|| EditionedFileId::current_edition(range.file_id));
+    let ctx = AssistContext::new(sema, config, hir::FileRange { file_id, range: range.range });
     let mut acc = Assists::new(&ctx, resolve);
     handlers::all().iter().for_each(|handler| {
         handler(&mut acc, &ctx);
@@ -115,6 +118,7 @@ mod handlers {
     mod bool_to_enum;
     mod change_visibility;
     mod convert_bool_then;
+    mod convert_closure_to_fn;
     mod convert_comment_block;
     mod convert_comment_from_or_to_doc;
     mod convert_from_to_tryfrom;
@@ -134,6 +138,7 @@ mod handlers {
     mod destructure_tuple_binding;
     mod desugar_doc_comment;
     mod expand_glob_import;
+    mod explicit_enum_discriminant;
     mod extract_expressions_from_format_string;
     mod extract_function;
     mod extract_module;
@@ -212,14 +217,15 @@ mod handlers {
     mod term_search;
     mod toggle_async_sugar;
     mod toggle_ignore;
+    mod toggle_macro_delimiter;
     mod unmerge_match_arm;
     mod unmerge_use;
     mod unnecessary_async;
     mod unqualify_method_call;
     mod unwrap_block;
-    mod unwrap_result_return_type;
+    mod unwrap_return_type;
     mod unwrap_tuple;
-    mod wrap_return_type_in_result;
+    mod wrap_return_type;
     mod wrap_unwrap_cfg_attr;
 
     pub(crate) fn all() -> &'static [Handler] {
@@ -244,6 +250,7 @@ mod handlers {
             toggle_async_sugar::sugar_impl_future_into_async,
             convert_comment_block::convert_comment_block,
             convert_comment_from_or_to_doc::convert_comment_from_or_to_doc,
+            convert_closure_to_fn::convert_closure_to_fn,
             convert_from_to_tryfrom::convert_from_to_tryfrom,
             convert_integer_literal::convert_integer_literal,
             convert_into_to_from::convert_into_to_from,
@@ -262,6 +269,7 @@ mod handlers {
             destructure_tuple_binding::destructure_tuple_binding,
             destructure_struct_binding::destructure_struct_binding,
             expand_glob_import::expand_glob_import,
+            explicit_enum_discriminant::explicit_enum_discriminant,
             extract_expressions_from_format_string::extract_expressions_from_format_string,
             extract_struct_from_enum_variant::extract_struct_from_enum_variant,
             extract_type_alias::extract_type_alias,
@@ -342,14 +350,15 @@ mod handlers {
             split_import::split_import,
             term_search::term_search,
             toggle_ignore::toggle_ignore,
+            toggle_macro_delimiter::toggle_macro_delimiter,
             unmerge_match_arm::unmerge_match_arm,
             unmerge_use::unmerge_use,
             unnecessary_async::unnecessary_async,
             unwrap_block::unwrap_block,
-            unwrap_result_return_type::unwrap_result_return_type,
+            unwrap_return_type::unwrap_return_type,
             unwrap_tuple::unwrap_tuple,
             unqualify_method_call::unqualify_method_call,
-            wrap_return_type_in_result::wrap_return_type_in_result,
+            wrap_return_type::wrap_return_type,
             wrap_unwrap_cfg_attr::wrap_unwrap_cfg_attr,
 
             // These are manually sorted for better priorities. By default,

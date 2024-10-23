@@ -1,26 +1,37 @@
 error[E0308]: mismatched types
-  --> $DIR/lazy_subtyping_of_opaques.rs:10:23
-   |
-LL | type Tait = impl FnOnce() -> ();
-   |             ------------------- the found opaque type
-...
-LL |     Thunk::new(|cont| cont)
-   |                       ^^^^ expected `()`, found opaque type
-   |
-   = note: expected unit type `()`
-            found opaque type `Tait`
-
-error[E0308]: mismatched types
-  --> $DIR/lazy_subtyping_of_opaques.rs:10:5
+  --> $DIR/lazy_subtyping_of_opaques.rs:11:5
    |
 LL | fn reify_as_tait() -> Thunk<Tait> {
    |                       ----------- expected `Thunk<_>` because of return type
+LL |
 LL |     Thunk::new(|cont| cont)
    |     ^^^^^^^^^^^^^^^^^^^^^^^ expected `Thunk<_>`, found `()`
    |
    = note: expected struct `Thunk<_>`
            found unit type `()`
 
-error: aborting due to 2 previous errors
+error[E0277]: expected a `FnOnce()` closure, found `()`
+  --> $DIR/lazy_subtyping_of_opaques.rs:11:23
+   |
+LL |     Thunk::new(|cont| cont)
+   |                       ^^^^ expected an `FnOnce()` closure, found `()`
+   |
+   = help: the trait `FnOnce()` is not implemented for `()`
+   = note: wrap the `()` in a closure with no arguments: `|| { /* code */ }`
 
-For more information about this error, try `rustc --explain E0308`.
+error[E0277]: expected a `FnOnce()` closure, found `()`
+  --> $DIR/lazy_subtyping_of_opaques.rs:9:23
+   |
+LL | fn reify_as_tait() -> Thunk<Tait> {
+   |                       ^^^^^^^^^^^ expected an `FnOnce()` closure, found `()`
+LL |
+LL |     Thunk::new(|cont| cont)
+   |     ----------------------- return type was inferred to be `{type error}` here
+   |
+   = help: the trait `FnOnce()` is not implemented for `()`
+   = note: wrap the `()` in a closure with no arguments: `|| { /* code */ }`
+
+error: aborting due to 3 previous errors
+
+Some errors have detailed explanations: E0277, E0308.
+For more information about an error, try `rustc --explain E0277`.

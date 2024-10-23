@@ -1,17 +1,19 @@
-use crate::infer::InferCtxt;
-use crate::traits;
+use std::iter;
+
 use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
-use rustc_infer::traits::ObligationCauseCode;
+use rustc_infer::traits::{ObligationCauseCode, PredicateObligations};
 use rustc_middle::bug;
 use rustc_middle::ty::{
-    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    self, GenericArg, GenericArgKind, GenericArgsRef, Ty, TyCtxt, TypeSuperVisitable,
+    TypeVisitable, TypeVisitableExt, TypeVisitor,
 };
-use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef};
-use rustc_span::def_id::{DefId, LocalDefId, CRATE_DEF_ID};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
+use rustc_span::{DUMMY_SP, Span};
+use tracing::{debug, instrument, trace};
 
-use std::iter;
+use crate::infer::InferCtxt;
+use crate::traits;
 /// Returns the set of obligations needed to make `arg` well-formed.
 /// If `arg` contains unresolved inference variables, this may include
 /// further WF obligations. However, if `arg` IS an unresolved
@@ -25,7 +27,7 @@ pub fn obligations<'tcx>(
     recursion_depth: usize,
     arg: GenericArg<'tcx>,
     span: Span,
-) -> Option<Vec<traits::PredicateObligation<'tcx>>> {
+) -> Option<PredicateObligations<'tcx>> {
     // Handle the "livelock" case (see comment above) by bailing out if necessary.
     let arg = match arg.unpack() {
         GenericArgKind::Type(ty) => {
@@ -59,11 +61,18 @@ pub fn obligations<'tcx>(
             .into()
         }
         // There is nothing we have to do for lifetimes.
-        GenericArgKind::Lifetime(..) => return Some(Vec::new()),
+        GenericArgKind::Lifetime(..) => return Some(PredicateObligations::new()),
     };
 
-    let mut wf =
-        WfPredicates { infcx, param_env, body_id, span, out: vec![], recursion_depth, item: None };
+    let mut wf = WfPredicates {
+        infcx,
+        param_env,
+        body_id,
+        span,
+        out: PredicateObligations::new(),
+        recursion_depth,
+        item: None,
+    };
     wf.compute(arg);
     debug!("wf::obligations({:?}, body_id={:?}) = {:?}", arg, body_id, wf.out);
 
@@ -80,7 +89,7 @@ pub fn unnormalized_obligations<'tcx>(
     infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     arg: GenericArg<'tcx>,
-) -> Option<Vec<traits::PredicateObligation<'tcx>>> {
+) -> Option<PredicateObligations<'tcx>> {
     debug_assert_eq!(arg, infcx.resolve_vars_if_possible(arg));
 
     // However, if `arg` IS an unresolved inference variable, returns `None`,
@@ -91,7 +100,7 @@ pub fn unnormalized_obligations<'tcx>(
     }
 
     if let ty::GenericArgKind::Lifetime(..) = arg.unpack() {
-        return Some(vec![]);
+        return Some(PredicateObligations::new());
     }
 
     let mut wf = WfPredicates {
@@ -99,7 +108,7 @@ pub fn unnormalized_obligations<'tcx>(
         param_env,
         body_id: CRATE_DEF_ID,
         span: DUMMY_SP,
-        out: vec![],
+        out: PredicateObligations::new(),
         recursion_depth: 0,
         item: None,
     };
@@ -118,13 +127,13 @@ pub fn trait_obligations<'tcx>(
     trait_pred: ty::TraitPredicate<'tcx>,
     span: Span,
     item: &'tcx hir::Item<'tcx>,
-) -> Vec<traits::PredicateObligation<'tcx>> {
+) -> PredicateObligations<'tcx> {
     let mut wf = WfPredicates {
         infcx,
         param_env,
         body_id,
         span,
-        out: vec![],
+        out: PredicateObligations::new(),
         recursion_depth: 0,
         item: Some(item),
     };
@@ -145,13 +154,13 @@ pub fn clause_obligations<'tcx>(
     body_id: LocalDefId,
     clause: ty::Clause<'tcx>,
     span: Span,
-) -> Vec<traits::PredicateObligation<'tcx>> {
+) -> PredicateObligations<'tcx> {
     let mut wf = WfPredicates {
         infcx,
         param_env,
         body_id,
         span,
-        out: vec![],
+        out: PredicateObligations::new(),
         recursion_depth: 0,
         item: None,
     };
@@ -190,7 +199,7 @@ struct WfPredicates<'a, 'tcx> {
     param_env: ty::ParamEnv<'tcx>,
     body_id: LocalDefId,
     span: Span,
-    out: Vec<traits::PredicateObligation<'tcx>>,
+    out: PredicateObligations<'tcx>,
     recursion_depth: usize,
     item: Option<&'tcx hir::Item<'tcx>>,
 }
@@ -321,7 +330,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         traits::ObligationCause::new(self.span, self.body_id, code)
     }
 
-    fn normalize(self, infcx: &InferCtxt<'tcx>) -> Vec<traits::PredicateObligation<'tcx>> {
+    fn normalize(self, infcx: &InferCtxt<'tcx>) -> PredicateObligations<'tcx> {
         // Do not normalize `wf` obligations with the new solver.
         //
         // The current deep normalization routine with the new solver does not
@@ -334,7 +343,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
 
         let cause = self.cause(ObligationCauseCode::WellFormed(None));
         let param_env = self.param_env;
-        let mut obligations = Vec::with_capacity(self.out.len());
+        let mut obligations = PredicateObligations::with_capacity(self.out.len());
         for mut obligation in self.out {
             assert!(!obligation.has_escaping_bound_vars());
             let mut selcx = traits::SelectionContext::new(infcx);
@@ -437,12 +446,6 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
 
     /// Pushes the obligations required for an alias (except inherent) to be WF
     /// into `self.out`.
-    fn compute_alias_ty(&mut self, data: ty::AliasTy<'tcx>) {
-        self.compute_alias_term(data.into());
-    }
-
-    /// Pushes the obligations required for an alias (except inherent) to be WF
-    /// into `self.out`.
     fn compute_alias_term(&mut self, data: ty::AliasTerm<'tcx>) {
         // A projection is well-formed if
         //
@@ -498,7 +501,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
             self.out.extend(obligations);
         }
 
-        self.compute_projection_args(data.args);
+        data.args.visit_with(self);
     }
 
     fn compute_projection_args(&mut self, args: GenericArgsRef<'tcx>) {
@@ -557,7 +560,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         &mut self,
         def_id: DefId,
         args: GenericArgsRef<'tcx>,
-    ) -> Vec<traits::PredicateObligation<'tcx>> {
+    ) -> PredicateObligations<'tcx> {
         let predicates = self.tcx().predicates_of(def_id);
         let mut origins = vec![def_id; predicates.predicates.len()];
         let mut head = predicates;
@@ -646,8 +649,6 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
-    type Result = ();
-
     fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
         debug!("wf bounds for t={:?} t.kind={:#?}", t, t.kind());
 
@@ -680,9 +681,21 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 self.require_sized(subty, ObligationCauseCode::SliceOrArrayElem);
             }
 
-            ty::Array(subty, _) => {
+            ty::Array(subty, len) => {
                 self.require_sized(subty, ObligationCauseCode::SliceOrArrayElem);
-                // Note that we handle the len is implicitly checked while walking `arg`.
+                // Note that the len being WF is implicitly checked while visiting.
+                // Here we just check that it's of type usize.
+                let cause = self.cause(ObligationCauseCode::Misc);
+                self.out.push(traits::Obligation::with_depth(
+                    tcx,
+                    cause,
+                    self.recursion_depth,
+                    self.param_env,
+                    ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(
+                        len,
+                        tcx.types.usize,
+                    ))),
+                ));
             }
 
             ty::Pat(subty, _) => {
@@ -702,8 +715,8 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
             }
 
             ty::Alias(ty::Projection | ty::Opaque | ty::Weak, data) => {
-                self.compute_alias_ty(data);
-                return; // Subtree handled by compute_projection.
+                let obligations = self.nominal_obligations(data.def_id, data.args);
+                self.out.extend(obligations);
             }
             ty::Alias(ty::Inherent, data) => {
                 self.compute_inherent_projection(data);
@@ -807,7 +820,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 return upvars.visit_with(self);
             }
 
-            ty::FnPtr(_) => {
+            ty::FnPtr(..) => {
                 // Let the visitor iterate into the argument/return
                 // types appearing in the fn signature.
             }
@@ -823,7 +836,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 // obligations that don't refer to Self and
                 // checking those
 
-                let defer_to_coercion = tcx.features().object_safe_for_dispatch;
+                let defer_to_coercion = tcx.features().dyn_compatible_for_dispatch();
 
                 if !defer_to_coercion {
                     if let Some(principal) = data.principal_def_id() {
@@ -832,7 +845,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                             self.cause(ObligationCauseCode::WellFormed(None)),
                             self.recursion_depth,
                             self.param_env,
-                            ty::Binder::dummy(ty::PredicateKind::ObjectSafe(principal)),
+                            ty::Binder::dummy(ty::PredicateKind::DynCompatible(principal)),
                         ));
                     }
                 }

@@ -12,10 +12,13 @@ builtin_macros_asm_duplicate_arg = duplicate argument named `{$name}`
 builtin_macros_asm_expected_comma = expected token: `,`
     .label = expected `,`
 
-builtin_macros_asm_expected_other = expected operand, {$is_global_asm ->
-    [true] options
-    *[false] clobber_abi, options
+builtin_macros_asm_expected_other = expected operand, {$is_inline_asm ->
+    [false] options
+    *[true] clobber_abi, options
     }, or additional template string
+
+builtin_macros_asm_expected_string_literal = expected string literal
+    .label = not a string literal
 
 builtin_macros_asm_explicit_register_name = explicit register arguments cannot have names
 
@@ -24,6 +27,8 @@ builtin_macros_asm_mayunwind = asm labels are not allowed with the `may_unwind` 
 builtin_macros_asm_modifier_invalid = asm template modifier must be a single character
 
 builtin_macros_asm_mutually_exclusive = the `{$opt1}` and `{$opt2}` options are mutually exclusive
+
+builtin_macros_asm_no_matched_argument_name = there is no argument named `{$name}`
 
 builtin_macros_asm_noreturn = asm outputs are not allowed with the `noreturn` option
 
@@ -46,6 +51,15 @@ builtin_macros_asm_sym_no_path = expected a path for argument to `sym`
 
 builtin_macros_asm_underscore_input = _ cannot be used for input operands
 
+builtin_macros_asm_unsupported_clobber_abi = `clobber_abi` cannot be used with `{$macro_name}!`
+
+builtin_macros_asm_unsupported_operand = the `{$symbol}` operand cannot be used with `{$macro_name}!`
+    .label = the `{$symbol}` operand is not meaningful for global-scoped inline assembly, remove it
+
+builtin_macros_asm_unsupported_option = the `{$symbol}` option cannot be used with `{$macro_name}!`
+    .label = the `{$symbol}` option is not meaningful for global-scoped inline assembly
+    .suggestion = remove this option
+
 builtin_macros_assert_missing_comma = unexpected string literal
     .suggestion = try adding a comma
 
@@ -55,6 +69,15 @@ builtin_macros_assert_requires_boolean = macro requires a boolean expression as 
 builtin_macros_assert_requires_expression = macro requires an expression as an argument
     .suggestion = try removing semicolon
 
+builtin_macros_autodiff = autodiff must be applied to function
+builtin_macros_autodiff_missing_config = autodiff requires at least a name and mode
+builtin_macros_autodiff_mode = unknown Mode: `{$mode}`. Use `Forward` or `Reverse`
+builtin_macros_autodiff_mode_activity = {$act} can not be used in {$mode} Mode
+builtin_macros_autodiff_not_build = this rustc version does not support autodiff
+builtin_macros_autodiff_number_activities = expected {$expected} activities, but found {$found}
+builtin_macros_autodiff_ty_activity = {$act} can not be used for this type
+
+builtin_macros_autodiff_unknown_activity = did not recognize Activity: `{$act}`
 builtin_macros_bad_derive_target = `derive` may only be applied to `struct`s, `enum`s and `union`s
     .label = not applicable here
     .label2 = not a `struct`, `enum` or `union`
@@ -109,9 +132,6 @@ builtin_macros_derive_path_args_list = traits in `#[derive(...)]` don't accept a
 
 builtin_macros_derive_path_args_value = traits in `#[derive(...)]` don't accept values
     .suggestion = remove the value
-
-builtin_macros_derive_unsafe_path = traits in `#[derive(...)]` don't accept `unsafe(...)`
-    .suggestion = remove the `unsafe(...)`
 
 builtin_macros_env_not_defined = environment variable `{$var}` not defined at compile time
     .cargo = Cargo sets build script variables at run time. Use `std::env::var({$var_expr})` instead
@@ -192,8 +212,6 @@ builtin_macros_format_unused_args = multiple unused formatting arguments
 
 builtin_macros_format_use_positional = consider using a positional formatting argument instead
 
-builtin_macros_global_asm_clobber_abi = `clobber_abi` cannot be used with `global_asm!`
-
 builtin_macros_invalid_crate_attribute = invalid crate attribute
 
 builtin_macros_multiple_default_attrs = multiple `#[default]` attributes
@@ -211,6 +229,11 @@ builtin_macros_multiple_defaults = multiple declared defaults
     .note = only one variant can be default
     .suggestion = make `{$ident}` default
 
+builtin_macros_naked_functions_testing_attribute =
+    cannot use `#[naked]` with testing attributes
+    .label = function marked with testing attribute here
+    .naked_attribute = `#[naked]` is incompatible with testing attributes
+
 builtin_macros_no_default_variant = no default declared
     .help = make a unit variant default by placing `#[default]` above it
     .suggestion = make `{$ident}` default
@@ -221,6 +244,8 @@ builtin_macros_non_exhaustive_default = default variant must be exhaustive
     .label = declared `#[non_exhaustive]` here
     .help = consider a manual implementation of `Default`
 
+builtin_macros_non_generic_pointee = the `#[pointee]` attribute may only be used on generic parameters
+
 builtin_macros_non_unit_default = the `#[default]` attribute may only be used on unit enum variants
     .help = consider a manual implementation of `Default`
 
@@ -228,9 +253,15 @@ builtin_macros_only_one_argument = {$name} takes 1 argument
 
 builtin_macros_proc_macro = `proc-macro` crate types currently cannot export any items other than functions tagged with `#[proc_macro]`, `#[proc_macro_derive]`, or `#[proc_macro_attribute]`
 
+builtin_macros_proc_macro_attribute_only_be_used_on_bare_functions = the `#[{$path}]` attribute may only be used on bare functions
+
+builtin_macros_proc_macro_attribute_only_usable_with_crate_type = the `#[{$path}]` attribute is only usable with crates of the `proc-macro` crate type
+
 builtin_macros_requires_cfg_pattern =
     macro requires a cfg-pattern as an argument
     .label = cfg-pattern required
+
+builtin_macros_source_uitls_expected_item = expected item, found `{$token}`
 
 builtin_macros_takes_no_arguments = {$name} takes no arguments
 

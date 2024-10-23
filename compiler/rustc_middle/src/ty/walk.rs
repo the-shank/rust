@@ -1,11 +1,11 @@
 //! An iterator over the type substructure.
 //! WARNING: this does not keep track of the region depth.
 
-use crate::ty::{self, Ty};
-use crate::ty::{GenericArg, GenericArgKind};
 use rustc_data_structures::sso::SsoHashSet;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use tracing::debug;
+
+use crate::ty::{self, GenericArg, GenericArgKind, Ty};
 
 // The TypeWalker's stack is hot enough that it's worth going to some effort to
 // avoid heap allocations.
@@ -77,23 +77,6 @@ impl<'tcx> GenericArg<'tcx> {
     /// ```
     pub fn walk(self) -> TypeWalker<'tcx> {
         TypeWalker::new(self)
-    }
-
-    /// Iterator that walks the immediate children of `self`. Hence
-    /// `Foo<Bar<i32>, u32>` yields the sequence `[Bar<i32>, u32]`
-    /// (but not `i32`, like `walk`).
-    ///
-    /// Iterator only walks items once.
-    /// It accepts visited set, updates it with all visited types
-    /// and skips any types that are already there.
-    pub fn walk_shallow(
-        self,
-        visited: &mut SsoHashSet<GenericArg<'tcx>>,
-    ) -> impl Iterator<Item = GenericArg<'tcx>> {
-        let mut stack = SmallVec::new();
-        push_inner(&mut stack, self);
-        stack.retain(|a| visited.insert(*a));
-        stack.into_iter()
     }
 }
 
@@ -206,9 +189,10 @@ fn push_inner<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent: GenericArg<'tcx>)
                 stack.extend(args.iter().rev());
             }
             ty::Tuple(ts) => stack.extend(ts.iter().rev().map(GenericArg::from)),
-            ty::FnPtr(sig) => {
-                stack.push(sig.skip_binder().output().into());
-                stack.extend(sig.skip_binder().inputs().iter().copied().rev().map(|ty| ty.into()));
+            ty::FnPtr(sig_tys, _hdr) => {
+                stack.extend(
+                    sig_tys.skip_binder().inputs_and_output.iter().rev().map(|ty| ty.into()),
+                );
             }
         },
         GenericArgKind::Lifetime(_) => {}

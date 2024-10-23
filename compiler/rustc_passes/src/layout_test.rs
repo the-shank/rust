@@ -2,14 +2,15 @@ use rustc_ast::Attribute;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::span_bug;
-use rustc_middle::ty::layout::{HasParamEnv, HasTyCtxt, LayoutError, LayoutOfHelpers, TyAndLayout};
+use rustc_middle::ty::layout::{HasParamEnv, HasTyCtxt, LayoutError, LayoutOfHelpers};
 use rustc_middle::ty::{self, ParamEnv, Ty, TyCtxt};
+use rustc_span::Span;
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::sym;
-use rustc_span::Span;
 use rustc_target::abi::{HasDataLayout, TargetDataLayout};
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
-use rustc_trait_selection::{infer::TyCtxtInferExt, traits};
+use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
+use rustc_trait_selection::infer::TyCtxtInferExt;
+use rustc_trait_selection::traits;
 
 use crate::errors::{
     LayoutAbi, LayoutAlign, LayoutHomogeneousAggregate, LayoutInvalidAttribute, LayoutOf,
@@ -17,7 +18,7 @@ use crate::errors::{
 };
 
 pub fn test_layout(tcx: TyCtxt<'_>) {
-    if !tcx.features().rustc_attrs {
+    if !tcx.features().rustc_attrs() {
         // if the `rustc_attrs` feature is not enabled, don't bother testing layout
         return;
     }
@@ -127,7 +128,7 @@ fn dump_layout_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId, attr: &Attribute) {
         }
 
         Err(layout_error) => {
-            tcx.dcx().emit_fatal(Spanned { node: layout_error.into_diagnostic(), span });
+            tcx.dcx().emit_err(Spanned { node: layout_error.into_diagnostic(), span });
         }
     }
 }
@@ -138,8 +139,6 @@ struct UnwrapLayoutCx<'tcx> {
 }
 
 impl<'tcx> LayoutOfHelpers<'tcx> for UnwrapLayoutCx<'tcx> {
-    type LayoutOfResult = TyAndLayout<'tcx>;
-
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
         span_bug!(span, "`#[rustc_layout(..)]` test resulted in `layout_of({ty}) = Err({err})`",);
     }

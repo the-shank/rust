@@ -1,19 +1,23 @@
+use std::assert_matches::assert_matches;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
-use crate::traits::error_reporting::{OverflowCause, TypeErrCtxtExt};
-use crate::traits::query::evaluate_obligation::InferCtxtExt;
-use crate::traits::{BoundVarReplacer, PlaceholderReplacer, ScrubbedTraitError};
 use rustc_data_structures::stack::ensure_sufficient_stack;
-use rustc_infer::infer::at::At;
 use rustc_infer::infer::InferCtxt;
+use rustc_infer::infer::at::At;
 use rustc_infer::traits::{FromSolverError, Obligation, TraitEngine};
 use rustc_middle::traits::ObligationCause;
-use rustc_middle::ty::{self, Ty, TyCtxt, UniverseIndex};
-use rustc_middle::ty::{FallibleTypeFolder, TypeFolder, TypeSuperFoldable};
-use rustc_middle::ty::{TypeFoldable, TypeVisitableExt};
+use rustc_middle::ty::{
+    self, FallibleTypeFolder, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeVisitableExt, UniverseIndex,
+};
+use tracing::instrument;
 
 use super::{FulfillmentCtxt, NextSolverError};
+use crate::error_reporting::InferCtxtErrorExt;
+use crate::error_reporting::traits::OverflowCause;
+use crate::traits::query::evaluate_obligation::InferCtxtExt;
+use crate::traits::{BoundVarReplacer, PlaceholderReplacer, ScrubbedTraitError};
 
 /// Deeply normalize all aliases in `value`. This does not handle inference and expects
 /// its input to be already fully resolved.
@@ -61,7 +65,7 @@ where
     E: FromSolverError<'tcx, NextSolverError<'tcx>>,
 {
     fn normalize_alias_ty(&mut self, alias_ty: Ty<'tcx>) -> Result<Ty<'tcx>, Vec<E>> {
-        assert!(matches!(alias_ty.kind(), ty::Alias(..)));
+        assert_matches!(alias_ty.kind(), ty::Alias(..));
 
         let infcx = self.at.infcx;
         let tcx = infcx.tcx;
@@ -126,12 +130,11 @@ where
         self.depth += 1;
 
         let new_infer_ct = infcx.next_const_var(self.at.cause.span);
-        let obligation = Obligation::new(
-            tcx,
-            self.at.cause.clone(),
-            self.at.param_env,
-            ty::NormalizesTo { alias: uv.into(), term: new_infer_ct.into() },
-        );
+        let obligation =
+            Obligation::new(tcx, self.at.cause.clone(), self.at.param_env, ty::NormalizesTo {
+                alias: uv.into(),
+                term: new_infer_ct.into(),
+            });
 
         let result = if infcx.predicate_may_hold(&obligation) {
             self.fulfill_cx.register_predicate_obligation(infcx, obligation);
@@ -156,7 +159,7 @@ where
 {
     type Error = Vec<E>;
 
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.at.infcx.tcx
     }
 
@@ -244,25 +247,25 @@ struct DeeplyNormalizeForDiagnosticsFolder<'a, 'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for DeeplyNormalizeForDiagnosticsFolder<'_, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.at.infcx.tcx
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        deeply_normalize_with_skipped_universes(
-            self.at,
-            ty,
-            vec![None; ty.outer_exclusive_binder().as_usize()],
-        )
+        deeply_normalize_with_skipped_universes(self.at, ty, vec![
+            None;
+            ty.outer_exclusive_binder()
+                .as_usize()
+        ])
         .unwrap_or_else(|_: Vec<ScrubbedTraitError<'tcx>>| ty.super_fold_with(self))
     }
 
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
-        deeply_normalize_with_skipped_universes(
-            self.at,
-            ct,
-            vec![None; ct.outer_exclusive_binder().as_usize()],
-        )
+        deeply_normalize_with_skipped_universes(self.at, ct, vec![
+            None;
+            ct.outer_exclusive_binder()
+                .as_usize()
+        ])
         .unwrap_or_else(|_: Vec<ScrubbedTraitError<'tcx>>| ct.super_fold_with(self))
     }
 }

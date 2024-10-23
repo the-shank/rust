@@ -6,17 +6,18 @@ pub mod map;
 pub mod nested_filter;
 pub mod place;
 
-use crate::query::Providers;
-use crate::ty::{EarlyBinder, ImplSubject, TyCtxt};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::sorted_map::SortedMap;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_data_structures::sync::{try_par_for_each_in, DynSend, DynSync};
+use rustc_data_structures::sync::{DynSend, DynSync, try_par_for_each_in};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
 use rustc_hir::*;
 use rustc_macros::{Decodable, Encodable, HashStable};
 use rustc_span::{ErrorGuaranteed, ExpnId};
+
+use crate::query::Providers;
+use crate::ty::{EarlyBinder, ImplSubject, TyCtxt};
 
 /// Gather the LocalDefId for each item-like within a module, including items contained within
 /// bodies. The Ids are in visitor order. This is used to partition a pass between modules.
@@ -27,6 +28,7 @@ pub struct ModuleItems {
     trait_items: Box<[TraitItemId]>,
     impl_items: Box<[ImplItemId]>,
     foreign_items: Box<[ForeignItemId]>,
+    opaques: Box<[LocalDefId]>,
     body_owners: Box<[LocalDefId]>,
 }
 
@@ -64,6 +66,10 @@ impl ModuleItems {
             .chain(self.foreign_items.iter().map(|id| id.owner_id))
     }
 
+    pub fn opaques(&self) -> impl Iterator<Item = LocalDefId> + '_ {
+        self.opaques.iter().copied()
+    }
+
     pub fn definitions(&self) -> impl Iterator<Item = LocalDefId> + '_ {
         self.owners().map(|id| id.def_id)
     }
@@ -94,6 +100,13 @@ impl ModuleItems {
         f: impl Fn(ForeignItemId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
     ) -> Result<(), ErrorGuaranteed> {
         try_par_for_each_in(&self.foreign_items[..], |&id| f(id))
+    }
+
+    pub fn par_opaques(
+        &self,
+        f: impl Fn(LocalDefId) -> Result<(), ErrorGuaranteed> + DynSend + DynSync,
+    ) -> Result<(), ErrorGuaranteed> {
+        try_par_for_each_in(&self.opaques[..], |&id| f(id))
     }
 }
 
@@ -201,7 +214,7 @@ pub fn provide(providers: &mut Providers) {
             ..
         })
         | Node::ForeignItem(&ForeignItem {
-            kind: ForeignItemKind::Fn(_, idents, _, _),
+            kind: ForeignItemKind::Fn(_, idents, _),
             ..
         }) = tcx.hir_node(tcx.local_def_id_to_hir_id(def_id))
         {

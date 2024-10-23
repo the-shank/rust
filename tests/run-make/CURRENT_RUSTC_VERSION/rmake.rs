@@ -3,17 +3,14 @@
 // Check that the `CURRENT_RUSTC_VERSION` placeholder is correctly replaced by the current
 // `rustc` version and the `since` property in feature stability gating is properly respected.
 
-use std::path::PathBuf;
-
-use run_make_support::{aux_build, rustc, source_root};
+use run_make_support::{aux_build, rfs, rustc, source_root};
 
 fn main() {
     aux_build().input("stable.rs").emit("metadata").run();
 
     let output =
         rustc().input("main.rs").emit("metadata").extern_("stable", "libstable.rmeta").run();
-
-    let version = std::fs::read_to_string(source_root().join("src/version")).unwrap();
+    let version = rfs::read_to_string(source_root().join("src/version"));
     let expected_string = format!("stable since {}", version.trim());
     output.assert_stderr_contains(expected_string);
 }

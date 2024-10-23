@@ -5,12 +5,16 @@
 //!
 //! It also checks that some targets have the correct set cfgs.
 
+// ignore-tidy-linelength
+//@ needs-llvm-components: arm x86
+// Note: without the needs-llvm-components it will fail on LLVM built without the required
+// components listed above.
+
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::iter::FromIterator;
 use std::path::PathBuf;
 
-use run_make_support::rustc;
+use run_make_support::{rfs, rustc};
 
 struct PrintCfg {
     target: &'static str,
@@ -91,12 +95,10 @@ fn check(PrintCfg { target, includes, disallow }: PrintCfg) {
     // --print=cfg=PATH
     {
         let tmp_path = PathBuf::from(format!("{target}.cfg"));
-        let mut print_arg = OsString::from("--print=cfg=");
-        print_arg.push(tmp_path.as_os_str());
 
-        rustc().target(target).arg(print_arg).run();
+        rustc().target(target).print(&format!("cfg={}", tmp_path.display())).run();
 
-        let output = std::fs::read_to_string(&tmp_path).unwrap();
+        let output = rfs::read_to_string(&tmp_path);
 
         check_(&output, includes, disallow);
     }

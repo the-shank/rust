@@ -1,5 +1,6 @@
-use super::super::*;
 use std::assert_matches::assert_matches;
+
+use super::super::*;
 
 // Test target self-consistency and JSON encoding/decoding roundtrip.
 pub(super) fn test_target(mut target: Target) {
@@ -150,6 +151,17 @@ impl Target {
         // Check crt static stuff
         if self.crt_static_default || self.crt_static_allows_dylibs {
             assert!(self.crt_static_respected);
+        }
+
+        // Check that RISC-V targets always specify which ABI they use.
+        match &*self.arch {
+            "riscv32" => {
+                assert_matches!(&*self.llvm_abiname, "ilp32" | "ilp32f" | "ilp32d" | "ilp32e")
+            }
+            "riscv64" => {
+                assert_matches!(&*self.llvm_abiname, "lp64" | "lp64f" | "lp64d" | "lp64q")
+            }
+            _ => {}
         }
     }
 

@@ -2,7 +2,7 @@ use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 
-use crate::{AnalysisDomain, GenKill, GenKillAnalysis};
+use crate::{Analysis, GenKill};
 
 /// A dataflow analysis that tracks whether a pointer or reference could possibly exist that points
 /// to a given local. This analysis ignores fake borrows, so it should not be used by
@@ -11,7 +11,7 @@ use crate::{AnalysisDomain, GenKill, GenKillAnalysis};
 /// At present, this is used as a very limited form of alias analysis. For example,
 /// `MaybeBorrowedLocals` is used to compute which locals are live during a yield expression for
 /// immovable coroutines.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct MaybeBorrowedLocals;
 
 impl MaybeBorrowedLocals {
@@ -20,7 +20,7 @@ impl MaybeBorrowedLocals {
     }
 }
 
-impl<'tcx> AnalysisDomain<'tcx> for MaybeBorrowedLocals {
+impl<'tcx> Analysis<'tcx> for MaybeBorrowedLocals {
     type Domain = BitSet<Local>;
     const NAME: &'static str = "maybe_borrowed_locals";
 
@@ -32,25 +32,17 @@ impl<'tcx> AnalysisDomain<'tcx> for MaybeBorrowedLocals {
     fn initialize_start_block(&self, _: &Body<'tcx>, _: &mut Self::Domain) {
         // No locals are aliased on function entry
     }
-}
 
-impl<'tcx> GenKillAnalysis<'tcx> for MaybeBorrowedLocals {
-    type Idx = Local;
-
-    fn domain_size(&self, body: &Body<'tcx>) -> usize {
-        body.local_decls.len()
-    }
-
-    fn statement_effect(
+    fn apply_statement_effect(
         &mut self,
-        trans: &mut impl GenKill<Self::Idx>,
+        trans: &mut Self::Domain,
         statement: &Statement<'tcx>,
         location: Location,
     ) {
         self.transfer_function(trans).visit_statement(statement, location);
     }
 
-    fn terminator_effect<'mir>(
+    fn apply_terminator_effect<'mir>(
         &mut self,
         trans: &mut Self::Domain,
         terminator: &'mir Terminator<'tcx>,
@@ -58,14 +50,6 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeBorrowedLocals {
     ) -> TerminatorEdges<'mir, 'tcx> {
         self.transfer_function(trans).visit_terminator(terminator, location);
         terminator.edges()
-    }
-
-    fn call_return_effect(
-        &mut self,
-        _trans: &mut Self::Domain,
-        _block: BasicBlock,
-        _return_places: CallReturnPlaces<'_, 'tcx>,
-    ) {
     }
 }
 
@@ -94,10 +78,10 @@ where
         match rvalue {
             // We ignore fake borrows as these get removed after analysis and shouldn't effect
             // the layout of generators.
-            Rvalue::AddressOf(_, borrowed_place)
+            Rvalue::RawPtr(_, borrowed_place)
             | Rvalue::Ref(_, BorrowKind::Mut { .. } | BorrowKind::Shared, borrowed_place) => {
                 if !borrowed_place.is_indirect() {
-                    self.trans.gen(borrowed_place.local);
+                    self.trans.gen_(borrowed_place.local);
                 }
             }
 
@@ -131,7 +115,7 @@ where
                 //
                 // [#61069]: https://github.com/rust-lang/rust/pull/61069
                 if !dropped_place.is_indirect() {
-                    self.trans.gen(dropped_place.local);
+                    self.trans.gen_(dropped_place.local);
                 }
             }
 
@@ -145,6 +129,7 @@ where
             | TerminatorKind::InlineAsm { .. }
             | TerminatorKind::UnwindResume
             | TerminatorKind::Return
+            | TerminatorKind::TailCall { .. }
             | TerminatorKind::SwitchInt { .. }
             | TerminatorKind::Unreachable
             | TerminatorKind::Yield { .. } => {}
@@ -158,8 +143,8 @@ pub fn borrowed_locals(body: &Body<'_>) -> BitSet<Local> {
 
     impl GenKill<Local> for Borrowed {
         #[inline]
-        fn gen(&mut self, elem: Local) {
-            self.0.gen(elem)
+        fn gen_(&mut self, elem: Local) {
+            self.0.gen_(elem)
         }
         #[inline]
         fn kill(&mut self, _: Local) {

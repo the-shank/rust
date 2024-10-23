@@ -1,12 +1,12 @@
-use crate::bolt::{bolt_optimize, with_bolt_instrumented};
 use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use log::LevelFilter;
 use utils::io;
 
+use crate::bolt::{bolt_optimize, with_bolt_instrumented};
 use crate::environment::{Environment, EnvironmentBuilder};
-use crate::exec::{cmd, Bootstrap};
+use crate::exec::{Bootstrap, cmd};
 use crate::tests::run_tests;
 use crate::timer::Timer;
 use crate::training::{

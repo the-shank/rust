@@ -1,10 +1,11 @@
+use std::ops::RangeInclusive;
+
 use rustc_middle::mir::{
     self, BasicBlock, CallReturnPlaces, Location, SwitchTargets, TerminatorEdges,
 };
-use std::ops::RangeInclusive;
 
 use super::visitor::{ResultsVisitable, ResultsVisitor};
-use super::{Analysis, Effect, EffectIndex, GenKillAnalysis, GenKillSet, SwitchIntTarget};
+use super::{Analysis, Effect, EffectIndex, SwitchIntTarget};
 
 pub trait Direction {
     const IS_FORWARD: bool;
@@ -28,27 +29,18 @@ pub trait Direction {
         state: &mut A::Domain,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
-        statement_effect: Option<&dyn Fn(BasicBlock, &mut A::Domain)>,
     ) -> TerminatorEdges<'mir, 'tcx>
     where
         A: Analysis<'tcx>;
 
-    fn gen_kill_statement_effects_in_block<'tcx, A>(
-        analysis: &mut A,
-        trans: &mut GenKillSet<A::Idx>,
-        block: BasicBlock,
-        block_data: &mir::BasicBlockData<'tcx>,
-    ) where
-        A: GenKillAnalysis<'tcx>;
-
-    fn visit_results_in_block<'mir, 'tcx, F, R>(
-        state: &mut F,
+    fn visit_results_in_block<'mir, 'tcx, D, R>(
+        state: &mut D,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
         results: &mut R,
-        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, FlowState = F>,
+        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, Domain = D>,
     ) where
-        R: ResultsVisitable<'tcx, FlowState = F>;
+        R: ResultsVisitable<'tcx, Domain = D>;
 
     fn join_state_into_successors_of<'tcx, A>(
         analysis: &mut A,
@@ -72,7 +64,6 @@ impl Direction for Backward {
         state: &mut A::Domain,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
-        statement_effect: Option<&dyn Fn(BasicBlock, &mut A::Domain)>,
     ) -> TerminatorEdges<'mir, 'tcx>
     where
         A: Analysis<'tcx>,
@@ -81,31 +72,12 @@ impl Direction for Backward {
         let location = Location { block, statement_index: block_data.statements.len() };
         analysis.apply_before_terminator_effect(state, terminator, location);
         let edges = analysis.apply_terminator_effect(state, terminator, location);
-        if let Some(statement_effect) = statement_effect {
-            statement_effect(block, state)
-        } else {
-            for (statement_index, statement) in block_data.statements.iter().enumerate().rev() {
-                let location = Location { block, statement_index };
-                analysis.apply_before_statement_effect(state, statement, location);
-                analysis.apply_statement_effect(state, statement, location);
-            }
-        }
-        edges
-    }
-
-    fn gen_kill_statement_effects_in_block<'tcx, A>(
-        analysis: &mut A,
-        trans: &mut GenKillSet<A::Idx>,
-        block: BasicBlock,
-        block_data: &mir::BasicBlockData<'tcx>,
-    ) where
-        A: GenKillAnalysis<'tcx>,
-    {
         for (statement_index, statement) in block_data.statements.iter().enumerate().rev() {
             let location = Location { block, statement_index };
-            analysis.before_statement_effect(trans, statement, location);
-            analysis.statement_effect(trans, statement, location);
+            analysis.apply_before_statement_effect(state, statement, location);
+            analysis.apply_statement_effect(state, statement, location);
         }
+        edges
     }
 
     fn apply_effects_in_range<'tcx, A>(
@@ -185,14 +157,14 @@ impl Direction for Backward {
         analysis.apply_statement_effect(state, statement, location);
     }
 
-    fn visit_results_in_block<'mir, 'tcx, F, R>(
-        state: &mut F,
+    fn visit_results_in_block<'mir, 'tcx, D, R>(
+        state: &mut D,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
         results: &mut R,
-        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, FlowState = F>,
+        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, Domain = D>,
     ) where
-        R: ResultsVisitable<'tcx, FlowState = F>,
+        R: ResultsVisitable<'tcx, Domain = D>,
     {
         results.reset_to_block_entry(state, block);
 
@@ -329,40 +301,19 @@ impl Direction for Forward {
         state: &mut A::Domain,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
-        statement_effect: Option<&dyn Fn(BasicBlock, &mut A::Domain)>,
     ) -> TerminatorEdges<'mir, 'tcx>
     where
         A: Analysis<'tcx>,
     {
-        if let Some(statement_effect) = statement_effect {
-            statement_effect(block, state)
-        } else {
-            for (statement_index, statement) in block_data.statements.iter().enumerate() {
-                let location = Location { block, statement_index };
-                analysis.apply_before_statement_effect(state, statement, location);
-                analysis.apply_statement_effect(state, statement, location);
-            }
+        for (statement_index, statement) in block_data.statements.iter().enumerate() {
+            let location = Location { block, statement_index };
+            analysis.apply_before_statement_effect(state, statement, location);
+            analysis.apply_statement_effect(state, statement, location);
         }
-
         let terminator = block_data.terminator();
         let location = Location { block, statement_index: block_data.statements.len() };
         analysis.apply_before_terminator_effect(state, terminator, location);
         analysis.apply_terminator_effect(state, terminator, location)
-    }
-
-    fn gen_kill_statement_effects_in_block<'tcx, A>(
-        analysis: &mut A,
-        trans: &mut GenKillSet<A::Idx>,
-        block: BasicBlock,
-        block_data: &mir::BasicBlockData<'tcx>,
-    ) where
-        A: GenKillAnalysis<'tcx>,
-    {
-        for (statement_index, statement) in block_data.statements.iter().enumerate() {
-            let location = Location { block, statement_index };
-            analysis.before_statement_effect(trans, statement, location);
-            analysis.statement_effect(trans, statement, location);
-        }
     }
 
     fn apply_effects_in_range<'tcx, A>(
@@ -443,9 +394,9 @@ impl Direction for Forward {
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
         results: &mut R,
-        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, FlowState = F>,
+        vis: &mut impl ResultsVisitor<'mir, 'tcx, R, Domain = F>,
     ) where
-        R: ResultsVisitable<'tcx, FlowState = F>,
+        R: ResultsVisitable<'tcx, Domain = F>,
     {
         results.reset_to_block_entry(state, block);
 

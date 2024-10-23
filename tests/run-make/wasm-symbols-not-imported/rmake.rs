@@ -1,7 +1,8 @@
 //@ only-wasm32-wasip1
 
-use run_make_support::{rustc, wasmparser};
 use std::path::Path;
+
+use run_make_support::{rfs, rustc, wasmparser};
 
 fn main() {
     rustc().input("foo.rs").target("wasm32-wasip1").run();
@@ -16,7 +17,7 @@ fn main() {
 
 fn verify_symbols(path: &Path) {
     eprintln!("verify {path:?}");
-    let file = std::fs::read(&path).unwrap();
+    let file = rfs::read(&path);
 
     for payload in wasmparser::Parser::new(0).parse_all(&file) {
         let payload = payload.unwrap();

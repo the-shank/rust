@@ -1,7 +1,5 @@
 //! Random access inspection of the results of a dataflow analysis.
 
-use crate::framework::BitSetExt;
-
 use std::cmp::Ordering;
 
 #[cfg(debug_assertions)]
@@ -219,16 +217,6 @@ where
     pub fn apply_custom_effect(&mut self, f: impl FnOnce(&mut A, &mut A::Domain)) {
         f(&mut self.results.analysis, &mut self.state);
         self.state_needs_reset = true;
-    }
-}
-
-impl<'mir, 'tcx, A> ResultsCursor<'mir, 'tcx, A>
-where
-    A: crate::GenKillAnalysis<'tcx>,
-    A::Domain: BitSetExt<A::Idx>,
-{
-    pub fn contains(&self, elem: A::Idx) -> bool {
-        self.get().contains(elem)
     }
 }
 

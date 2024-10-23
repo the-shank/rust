@@ -1,7 +1,5 @@
 use std::iter;
 
-use rustc_hir as hir;
-use rustc_target::spec::abi;
 pub use rustc_type_ir::relate::*;
 
 use crate::ty::error::{ExpectedFound, TypeError};
@@ -9,18 +7,6 @@ use crate::ty::predicate::ExistentialPredicateStableCmpExt as _;
 use crate::ty::{self as ty, Ty, TyCtxt};
 
 pub type RelateResult<'tcx, T> = rustc_type_ir::relate::RelateResult<TyCtxt<'tcx>, T>;
-
-/// Whether aliases should be related structurally or not. Used
-/// to adjust the behavior of generalization and combine.
-///
-/// This should always be `No` unless in a few special-cases when
-/// instantiating canonical responses and in the new solver. Each
-/// such case should have a comment explaining why it is used.
-#[derive(Debug, Copy, Clone)]
-pub enum StructurallyRelateAliases {
-    Yes,
-    No,
-}
 
 impl<'tcx> Relate<TyCtxt<'tcx>> for ty::ImplSubject<'tcx> {
     #[inline]
@@ -81,7 +67,7 @@ impl<'tcx> Relate<TyCtxt<'tcx>> for ty::Pattern<'tcx> {
                 if inc_a != inc_b {
                     todo!()
                 }
-                Ok(relation.tcx().mk_pat(ty::PatternKind::Range { start, end, include_end: inc_a }))
+                Ok(relation.cx().mk_pat(ty::PatternKind::Range { start, end, include_end: inc_a }))
             }
         }
     }
@@ -93,7 +79,7 @@ impl<'tcx> Relate<TyCtxt<'tcx>> for &'tcx ty::List<ty::PolyExistentialPredicate<
         a: Self,
         b: Self,
     ) -> RelateResult<'tcx, Self> {
-        let tcx = relation.tcx();
+        let tcx = relation.cx();
 
         // FIXME: this is wasteful, but want to do a perf run to see how slow it is.
         // We need to perform this deduplication as we sometimes generate duplicate projections
@@ -130,26 +116,6 @@ impl<'tcx> Relate<TyCtxt<'tcx>> for &'tcx ty::List<ty::PolyExistentialPredicate<
             }
         });
         tcx.mk_poly_existential_predicates_from_iter(v)
-    }
-}
-
-impl<'tcx> Relate<TyCtxt<'tcx>> for hir::Safety {
-    fn relate<R: TypeRelation<TyCtxt<'tcx>>>(
-        _relation: &mut R,
-        a: hir::Safety,
-        b: hir::Safety,
-    ) -> RelateResult<'tcx, hir::Safety> {
-        if a != b { Err(TypeError::SafetyMismatch(ExpectedFound::new(true, a, b))) } else { Ok(a) }
-    }
-}
-
-impl<'tcx> Relate<TyCtxt<'tcx>> for abi::Abi {
-    fn relate<R: TypeRelation<TyCtxt<'tcx>>>(
-        _relation: &mut R,
-        a: abi::Abi,
-        b: abi::Abi,
-    ) -> RelateResult<'tcx, abi::Abi> {
-        if a == b { Ok(a) } else { Err(TypeError::AbiMismatch(ExpectedFound::new(true, a, b))) }
     }
 }
 
@@ -224,15 +190,7 @@ impl<'tcx> Relate<TyCtxt<'tcx>> for ty::GenericArg<'tcx> {
             (ty::GenericArgKind::Const(a_ct), ty::GenericArgKind::Const(b_ct)) => {
                 Ok(relation.relate(a_ct, b_ct)?.into())
             }
-            (ty::GenericArgKind::Lifetime(unpacked), x) => {
-                bug!("impossible case reached: can't relate: {:?} with {:?}", unpacked, x)
-            }
-            (ty::GenericArgKind::Type(unpacked), x) => {
-                bug!("impossible case reached: can't relate: {:?} with {:?}", unpacked, x)
-            }
-            (ty::GenericArgKind::Const(unpacked), x) => {
-                bug!("impossible case reached: can't relate: {:?} with {:?}", unpacked, x)
-            }
+            _ => bug!("impossible case reached: can't relate: {a:?} with {b:?}"),
         }
     }
 }

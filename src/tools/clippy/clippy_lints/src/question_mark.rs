@@ -1,18 +1,19 @@
 use crate::manual_let_else::MANUAL_LET_ELSE;
 use crate::question_mark_used::QUESTION_MARK_USED;
+use clippy_config::Conf;
 use clippy_config::msrvs::Msrv;
 use clippy_config::types::MatchLintBehaviour;
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::ty::{implements_trait, is_type_diagnostic_item};
 use clippy_utils::{
-    eq_expr_value, higher, in_constant, is_else_clause, is_lint_allowed, is_path_lang_item, is_res_lang_ctor,
+    eq_expr_value, higher, is_else_clause, is_in_const_context, is_lint_allowed, is_path_lang_item, is_res_lang_ctor,
     pat_and_expr_can_be_question_mark, path_to_local, path_to_local_id, peel_blocks, peel_blocks_with_stmt,
     span_contains_comment,
 };
 use rustc_errors::Applicability;
-use rustc_hir::def::Res;
 use rustc_hir::LangItem::{self, OptionNone, OptionSome, ResultErr, ResultOk};
+use rustc_hir::def::Res;
 use rustc_hir::{
     BindingMode, Block, Body, ByRef, Expr, ExprKind, LetStmt, Mutability, Node, PatKind, PathSegment, QPath, Stmt,
     StmtKind,
@@ -62,11 +63,10 @@ pub struct QuestionMark {
 impl_lint_pass!(QuestionMark => [QUESTION_MARK, MANUAL_LET_ELSE]);
 
 impl QuestionMark {
-    #[must_use]
-    pub fn new(msrv: Msrv, matches_behaviour: MatchLintBehaviour) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            msrv,
-            matches_behaviour,
+            msrv: conf.msrv.clone(),
+            matches_behaviour: conf.matches_for_let_else,
             try_block_depth_stack: Vec::new(),
         }
     }
@@ -206,12 +206,11 @@ fn expr_return_none_or_err(
             sym::Result => path_to_local(expr).is_some() && path_to_local(expr) == path_to_local(cond_expr),
             _ => false,
         },
-        ExprKind::Call(call_expr, args_expr) => {
+        ExprKind::Call(call_expr, [arg]) => {
             if smbl == sym::Result
                 && let ExprKind::Path(QPath::Resolved(_, path)) = &call_expr.kind
                 && let Some(segment) = path.segments.first()
                 && let Some(err_sym) = err_sym
-                && let Some(arg) = args_expr.first()
                 && let ExprKind::Path(QPath::Resolved(_, arg_path)) = &arg.kind
                 && let Some(PathSegment { ident, .. }) = arg_path.segments.first()
             {
@@ -241,7 +240,7 @@ fn expr_return_none_or_err(
 fn check_is_none_or_err_and_early_return<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) {
     if let Some(higher::If { cond, then, r#else }) = higher::If::hir(expr)
         && !is_else_clause(cx.tcx, expr)
-        && let ExprKind::MethodCall(segment, caller, ..) = &cond.kind
+        && let ExprKind::MethodCall(segment, caller, [], _) = &cond.kind
         && let caller_ty = cx.typeck_results().expr_ty(caller)
         && let if_block = IfBlockType::IfIs(caller, caller_ty, segment.ident.name, then)
         && (is_early_return(sym::Option, cx, &if_block) || is_early_return(sym::Result, cx, &if_block))
@@ -332,7 +331,7 @@ impl QuestionMark {
 
 fn is_try_block(cx: &LateContext<'_>, bl: &Block<'_>) -> bool {
     if let Some(expr) = bl.expr
-        && let ExprKind::Call(callee, _) = expr.kind
+        && let ExprKind::Call(callee, [_]) = expr.kind
     {
         is_path_lang_item(cx, callee, LangItem::TryTraitFromOutput)
     } else {
@@ -346,15 +345,13 @@ impl<'tcx> LateLintPass<'tcx> for QuestionMark {
             return;
         }
 
-        if !self.inside_try_block() && !in_constant(cx, stmt.hir_id) {
+        if !self.inside_try_block() && !is_in_const_context(cx) {
             check_let_some_else_return_none(cx, stmt);
         }
         self.check_manual_let_else(cx, stmt);
     }
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        if !self.inside_try_block()
-            && !in_constant(cx, expr.hir_id)
-            && is_lint_allowed(cx, QUESTION_MARK_USED, expr.hir_id)
+        if !self.inside_try_block() && !is_in_const_context(cx) && is_lint_allowed(cx, QUESTION_MARK_USED, expr.hir_id)
         {
             check_is_none_or_err_and_early_return(cx, expr);
             check_if_let_some_or_err_and_early_return(cx, expr);
