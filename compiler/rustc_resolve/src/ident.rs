@@ -912,6 +912,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         let key = BindingKey::new(ident, ns);
         let resolution =
             self.resolution(module, key).try_borrow_mut().map_err(|_| (Determined, Weak::No))?; // This happens when there is a cycle of imports.
+        debug!(">> resolution:\n{:#?}", resolution);
 
         // If the primary binding is unusable, search further and return the shadowed glob
         // binding if it exists. What we really want here is having two separate scopes in
